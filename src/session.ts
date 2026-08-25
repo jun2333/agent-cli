@@ -235,3 +235,119 @@ export function loadMemory(): string | null {
     return null
   }
 }
+
+// === memory 索引化（按类型拆文件 + index.md 索引，工具自动维护） ===
+
+const memoryDir = () => join(agentCliDir(), 'memory')
+const memoryIndexFile = () => join(memoryDir(), 'index.md')
+
+/** topic → 记忆文件名（安全校验：拒绝空/保留字/路径穿越/含分隔符）。非法返回 null。 */
+export function memoryTopicToFile(topic: string): string | null {
+  if (!topic || !topic.trim()) return null
+  const t = topic.trim()
+  if (t === 'index') return null
+  if (t.includes('/') || t.includes('\\') || t.includes('..')) return null
+  return `${t}.md`
+}
+
+/** 读取记忆索引（index.md）全文；无记忆返回空串 */
+export function readMemoryIndex(): string {
+  try {
+    const f = memoryIndexFile()
+    if (!existsSync(f)) return ''
+    return readFileSync(f, 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+/** 读取某类型记忆文件全文。topic 不存在或非法返回错误。 */
+export function readMemoryTopic(topic: string): { ok: true; content: string } | { ok: false; error: string } {
+  const file = memoryTopicToFile(topic)
+  if (!file) return { ok: false, error: `topic 非法（不能为空/含 ../ / 路径分隔符，index 为保留字）` }
+  try {
+    const f = join(memoryDir(), file)
+    if (!existsSync(f)) return { ok: false, error: `topic "${topic}" 暂无记忆` }
+    return { ok: true, content: readFileSync(f, 'utf8').replace(/\s+$/, '') }
+  } catch (e: any) {
+    return { ok: false, error: `读取失败: ${e.message}` }
+  }
+}
+
+/** 追加一条记忆到 <topic>.md，并自动重建索引 */
+export function appendMemory(topic: string, content: string): { ok: true } | { ok: false; error: string } {
+  const file = memoryTopicToFile(topic)
+  if (!file) return { ok: false, error: `topic 非法（不能为空/含 ../ / 路径分隔符，index 为保留字）` }
+  try {
+    const dir = memoryDir()
+    mkdirSync(dir, { recursive: true })
+    const full = join(dir, file)
+    const existing = existsSync(full) ? readFileSync(full, 'utf8').replace(/\s+$/, '') : ''
+    writeFileSync(full, `${existing ? existing + '\n' : ''}${content}\n`, 'utf8')
+    rebuildMemoryIndex()
+    return { ok: true }
+  } catch (e: any) {
+    return { ok: false, error: `写入失败: ${e.message}` }
+  }
+}
+
+/** 覆盖 <topic>.md 内容，并自动重建索引 */
+export function writeMemory(topic: string, content: string): { ok: true } | { ok: false; error: string } {
+  const file = memoryTopicToFile(topic)
+  if (!file) return { ok: false, error: `topic 非法（不能为空/含 ../ / 路径分隔符，index 为保留字）` }
+  try {
+    const dir = memoryDir()
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, file), `${content}\n`, 'utf8')
+    rebuildMemoryIndex()
+    return { ok: true }
+  } catch (e: any) {
+    return { ok: false, error: `写入失败: ${e.message}` }
+  }
+}
+
+/** 重扫 memory/*.md（除 index.md）生成 index.md：类型分组 + 每条一句话摘要（行内容前 40 字） */
+function rebuildMemoryIndex(): void {
+  try {
+    const dir = memoryDir()
+    if (!existsSync(dir)) return
+    const topics: Array<{ topic: string; lines: string[] }> = []
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.md') || name === 'index.md') continue
+      const lines = readFileSync(join(dir, name), 'utf8')
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+      if (lines.length > 0) topics.push({ topic: name.replace(/\.md$/, ''), lines })
+    }
+    if (topics.length === 0) {
+      writeFileSync(memoryIndexFile(), '')
+      return
+    }
+    const parts = ['# Memory Index']
+    for (const t of topics) {
+      parts.push(`\n## ${t.topic}`)
+      for (const l of t.lines) parts.push(`- ${l.length > 40 ? l.slice(0, 40) + '…' : l}`)
+    }
+    writeFileSync(memoryIndexFile(), parts.join('\n') + '\n')
+  } catch {
+    // 索引重建失败不阻塞主流程
+  }
+}
+
+/** 兼容旧版单文件 memory.md：存在且尚无索引时，迁入 preferences.md 并重建索引 */
+export function migrateLegacyMemory(): void {
+  try {
+    const dir = memoryDir()
+    const legacy = join(dir, 'memory.md')
+    if (!existsSync(legacy) || existsSync(memoryIndexFile())) return
+    const content = readFileSync(legacy, 'utf8').trim()
+    if (!content) return
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'preferences.md'), content + '\n', 'utf8')
+    rmSync(legacy, { force: true })
+    rebuildMemoryIndex()
+  } catch {
+    // 迁移失败不阻塞
+  }
+}

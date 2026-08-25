@@ -3,7 +3,7 @@ tags: [memory, design, rag-lite]
 confidence: 0.5
 created: 2026-08-25
 last_used: 2026-08-25
-use_count: 1
+use_count: 2
 source_task: 001
 status: active
 invalidation_condition: "当长期记忆改为数据库/向量检索等非文件索引方案时失效"

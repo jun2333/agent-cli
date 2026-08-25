@@ -5,6 +5,7 @@ import { promisify } from 'util'
 import { glob as globFiles } from 'glob'
 import type { OpenAI } from 'openai'
 import { projectRoot, config } from '../config.js'
+import { readMemoryIndex, readMemoryTopic, appendMemory, writeMemory } from '../session.js'
 
 const execAsync = promisify(exec)
 
@@ -123,6 +124,50 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           query: { type: 'string', description: '搜索关键词' },
         },
         required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_memory',
+      description: '读取长期记忆：无 topic 返回记忆索引（类型 + 每条一句话摘要）；有 topic 返回对应类型记忆的完整内容。',
+      parameters: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string', description: '记忆类型名（如 preferences/project），可选；缺省返回索引' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'append_memory',
+      description: '向指定类型的长期记忆追加一条内容，并自动更新记忆索引。用于记录用户偏好、项目约定等。',
+      parameters: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string', description: '记忆类型名（如 preferences/project）' },
+          content: { type: 'string', description: '要追加的记忆内容（一句话）' },
+          summary: { type: 'string', description: '可选的一句话摘要；缺省用 content 前 40 字' },
+        },
+        required: ['topic', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_memory',
+      description: '覆盖指定类型的长期记忆内容，并自动重建记忆索引。用于修正/重写某类记忆。',
+      parameters: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string', description: '记忆类型名（如 preferences/project）' },
+          content: { type: 'string', description: '覆盖后的完整内容（可多行，每行一条记忆）' },
+        },
+        required: ['topic', 'content'],
       },
     },
   },
@@ -367,6 +412,31 @@ export function createTools(): { definitions: typeof toolDefinitions; implementa
       } catch (e: any) {
         return { content: JSON.stringify({ error: `搜索失败: ${e.message}` }) }
       }
+    },
+
+    read_memory: async ({ topic }: { topic?: string }) => {
+      if (topic === undefined) {
+        const idx = readMemoryIndex()
+        return { content: idx.trim() ? idx : JSON.stringify({ note: '暂无记忆' }) }
+      }
+      const r = readMemoryTopic(String(topic))
+      return r.ok ? { content: r.content } : { content: JSON.stringify({ error: r.error }) }
+    },
+
+    append_memory: async ({ topic, content }: { topic: string; content: string }) => {
+      if (typeof topic !== 'string' || typeof content !== 'string') {
+        return { content: JSON.stringify({ error: 'topic/content 参数必须是字符串' }) }
+      }
+      const r = appendMemory(topic, content)
+      return r.ok ? { content: JSON.stringify({ ok: true, topic }) } : { content: JSON.stringify({ error: r.error }) }
+    },
+
+    write_memory: async ({ topic, content }: { topic: string; content: string }) => {
+      if (typeof topic !== 'string' || typeof content !== 'string') {
+        return { content: JSON.stringify({ error: 'topic/content 参数必须是字符串' }) }
+      }
+      const r = writeMemory(topic, content)
+      return r.ok ? { content: JSON.stringify({ ok: true, topic }) } : { content: JSON.stringify({ error: r.error }) }
     },
   }
 

@@ -10,7 +10,8 @@ import {
   saveSession,
   ensureAgentCliDir,
   loadUserPrompt,
-  loadMemory,
+  readMemoryIndex,
+  migrateLegacyMemory,
   listSessions,
   newSessionId,
   acquireSessionLock,
@@ -32,12 +33,14 @@ const DEFAULT_SYSTEM_PROMPT = `你是一个运行在终端里的通用编程助�
 - 工具执行失败时，先看错误信息再决定下一步，不要盲目重试
 - 完成任务时，简要说明你做了什么和结果`
 
-/** 组装 system prompt：用户根提示词（若有）> 默认提示词，再追加用户 memory（若有） */
+/** 组装 system prompt：用户根提示词（若有）> 默认提示词，再拼记忆索引（按需加载） */
 function buildSystemPrompt(): string {
   ensureAgentCliDir()
+  migrateLegacyMemory() // 兼容旧版单文件 memory.md
   const base = loadUserPrompt() ?? DEFAULT_SYSTEM_PROMPT
-  const memory = loadMemory()
-  return memory ? `${base}\n\n# Memory\n${memory}` : base
+  const index = readMemoryIndex()
+  if (!index.trim()) return base
+  return `${base}\n\n# Memory\n${index}\n\n> 记忆已索引：不确定时用 read_memory(topic) 按需读取具体记忆。`
 }
 
 const DIM = '\x1b[90m'
@@ -360,6 +363,11 @@ async function startInteractive(systemPrompt: string, resumeFlag: boolean) {
       }
       if (text === '/help') {
         ui.addInfo(HELP_TEXT)
+        return
+      }
+      if (text === '/memory') {
+        const idx = readMemoryIndex()
+        ui.addInfo(idx.trim() ? idx : '暂无记忆')
         return
       }
       if (running) {

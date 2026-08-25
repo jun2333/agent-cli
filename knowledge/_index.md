@@ -30,6 +30,9 @@
 - [索引化记忆 + 按需加载](lessons/001-memory-index-loading.md) — CLI agent 需要跨会话长期记忆，但直接全量加载记忆进 system prompt 会随内容膨胀；LLM 需要先知道"有什么"再决定"读什么"。
 - [对话式完成工作流阶段后需补编排层状态](lessons/002-orchestrator-stage-result.md) — 用 harness requirements 等工作流时，各阶段产出以对话方式完成（用户逐条拍板、文档定稿），但未逐阶段调用 `core.js` 推进编排层。
 - [task 目录命名规范（workspace/{task-id}）](lessons/003-task-dir-naming.md) — harness 工作流的任务目录命名。
+- [用户输入 → 文件名的安全映射（防路径穿越）](lessons/004-topic-to-file-safe-mapping.md) — 工具接受用户/LLM 提供的字符串参数（如 memory 的 `topic`）并拼成文件路径。
+- [verify 捕获的日志需禁用 ANSI 颜色](lessons/005-verify-log-no-ansi.md) — verify 通道用 `execSync` 捕获子命令（vitest/tsc）stdout 到 log 文件。
+- [工作流 sections 校验是精确标题匹配](lessons/006-workflow-sections-exact-match.md) — validate 检查阶段产出物的必含区块（workflow.yaml 的 sections）。
 
 ## 归档 (Archive)
 

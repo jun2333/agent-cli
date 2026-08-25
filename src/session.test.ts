@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs'
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import {
@@ -12,6 +12,12 @@ import {
   releaseSessionLock,
   isSessionLocked,
   sessionWorkspaceDir,
+  memoryTopicToFile,
+  readMemoryIndex,
+  readMemoryTopic,
+  appendMemory,
+  writeMemory,
+  migrateLegacyMemory,
 } from './session.js'
 
 let tmp: string
@@ -128,5 +134,56 @@ describe('会话锁', () => {
     writeFileSync(join(sessionWorkspaceDir(), `${id}.lock`), JSON.stringify({ pid: process.ppid }))
     const list = listSessions()
     expect(list[0].locked).toBe(true)
+  })
+})
+
+describe('memory 索引化', () => {
+  it('memoryTopicToFile 安全校验', () => {
+    expect(memoryTopicToFile('preferences')).toBe('preferences.md')
+    expect(memoryTopicToFile('')).toBeNull()
+    expect(memoryTopicToFile('index')).toBeNull()
+    expect(memoryTopicToFile('../etc')).toBeNull()
+    expect(memoryTopicToFile('a/b')).toBeNull()
+    expect(memoryTopicToFile('a\\b')).toBeNull()
+  })
+
+  it('appendMemory 追加并自动更新索引', () => {
+    const r1 = appendMemory('preferences', '用户喜欢 Python')
+    expect(r1.ok).toBe(true)
+    const r2 = appendMemory('preferences', '回答用中文')
+    expect(r2.ok).toBe(true)
+    const idx = readMemoryIndex()
+    expect(idx).toContain('# Memory Index')
+    expect(idx).toContain('## preferences')
+    expect(idx).toContain('用户喜欢 Python')
+    expect(idx).toContain('回答用中文')
+  })
+
+  it('writeMemory 覆盖并重建索引', () => {
+    appendMemory('project', '旧约定')
+    writeMemory('project', '新约定：验证用 pnpm build')
+    const idx = readMemoryIndex()
+    expect(idx).toContain('新约定：验证用 pnpm build')
+    expect(idx).not.toContain('旧约定')
+  })
+
+  it('readMemoryTopic 返回内容；不存在返回错误', () => {
+    appendMemory('preferences', '测试记忆')
+    const r = readMemoryTopic('preferences')
+    expect(r.ok && r.content).toContain('测试记忆')
+    const missing = readMemoryTopic('nonexistent-topic')
+    expect(missing.ok).toBe(false)
+    const bad = readMemoryTopic('../etc')
+    expect(bad.ok).toBe(false)
+  })
+
+  it('migrateLegacyMemory 迁移旧版 memory.md', () => {
+    const dir = join(process.env.AGENT_CLI_DIR!, 'memory')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'memory.md'), '旧版记忆内容')
+    migrateLegacyMemory()
+    expect(readMemoryIndex()).toContain('旧版记忆内容')
+    expect(existsSync(join(dir, 'preferences.md'))).toBe(true)
+    expect(existsSync(join(dir, 'memory.md'))).toBe(false)
   })
 })
