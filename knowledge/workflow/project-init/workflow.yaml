@@ -1,0 +1,65 @@
+# template: project-init
+name: project-init
+description: 从零开始的项目初始化流程（技术选型 + 标准定制 + 脚手架搭建）
+
+# 工作流验证手段（测试手段定义，见 docs/workflow-spec.md）
+# 项目初始化无代码验证阶段，checks 留空
+verify:
+  checks: []
+
+# 任务开始前
+pre_task:
+  - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+    action: init
+
+stages:
+  - name: project-init
+    executor: subagent
+    skill: .harness/skills/tools/project-init/SKILL.md
+    sub_command: full
+    input: task.md
+    output: [tech-selection.md, project-standards.md]
+    sections: []
+    require_verify: false
+    permission: workspace-write
+    tools: code-mode
+    gate: user_approval
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: reflecting
+    executor: inline
+    skill: .harness/skills/framework/reflecting/SKILL.md
+    sub_command: reflect
+    input: [task.md, tech-selection.md, project-standards.md]
+    output: lessons-draft.md
+    sections: []
+    require_verify: false
+    permission: read-only
+    tools: read+bash
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+
+  - name: git-operations
+    executor: inline
+    skill: knowledge/skills/git-operations/SKILL.md
+    sub_command: commit
+    input: [tech-selection.md, project-standards.md]
+    output: changes.md
+    sections: []
+    require_verify: false
+    permission: workspace-write
+    tools: bash
+    gate: user_approval
+    optional: true
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: complete
+
+post_task:
+  - skill: .harness/skills/framework/reflecting/SKILL.md
+    sub_command: collect
+    trigger: manual

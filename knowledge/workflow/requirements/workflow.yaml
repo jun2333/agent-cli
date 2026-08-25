@@ -1,0 +1,60 @@
+# template: requirements
+name: requirements
+description: 需求构建流程——收集需求 → 用户确认草稿定稿 → 撰写需求文档 → 沉淀经验。作为 feature 等代码流程的前置输入。非代码任务。
+
+# 不强制 verify：需求文档无需机械"测试"（req-check 结构校验保留为可选工具，
+# 用户在 elicitation 确认时如需可自行运行）。结构完整性由 gate-check/validate 的 sections 兜底。
+
+# 任务开始前
+pre_task:
+  - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+    action: init
+
+stages:
+  - name: elicitation
+    executor: subagent
+    skill: .harness/skills/requirements/elicitation/SKILL.md
+    input: task.md
+    output: task.md
+    sections:
+      - [## 背景与目标]
+      - [## 待确认问题]
+    gate: user_approval
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: drafting
+    executor: subagent
+    skill: .harness/skills/requirements/drafting/SKILL.md
+    input: [task.md]
+    output: task.md
+    sections:
+      - [## 背景与目标]
+      - [## 范围]
+      - [## 功能需求]
+      - [## 验收标准]
+      - [## 待确认问题]
+    gate: none
+    on_fail: elicitation
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: reflecting
+    executor: inline
+    skill: .harness/skills/framework/reflecting/SKILL.md
+    sub_command: reflect
+    input: [task.md]
+    output: lessons-draft.md
+    sections: []
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: complete
+
+post_task:
+  - skill: .harness/skills/framework/reflecting/SKILL.md
+    sub_command: collect
+    trigger: manual

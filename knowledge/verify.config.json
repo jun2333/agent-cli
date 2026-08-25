@@ -1,0 +1,8 @@
+{
+  "schema_version": "verify.config.v2",
+  "commands": {
+    "build": "pnpm build",
+    "test": "pnpm test"
+  },
+  "timeout_ms": 180000
+}

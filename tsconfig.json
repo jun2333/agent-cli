@@ -1,15 +1,25 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "lib": ["ES2022"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
+    // 显式引入 Node 类型：让 process/console/Buffer 等全局类型可用（消除编辑器里的 process 警告）
+    "types": ["node"],
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    // 与 tsx/esbuild 运行时兼容：要求每个文件独立可编译
+    "isolatedModules": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
+    "sourceMap": true,
     "outDir": "dist",
     "rootDir": "src"
   },
-  "include": ["src"]
+  "include": ["src"],
+  // 测试文件与 vitest 配置不进编译产物
+  "exclude": ["src/**/*.test.ts", "vitest.config.ts"]
 }

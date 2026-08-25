@@ -86,6 +86,7 @@ export async function* runAgentLoop(opts: LoopOptions): AsyncGenerator<LoopEvent
       let args: unknown = {}
 
       if (fn) {
+        yield { type: 'status', phase: 'tool_start' }
         try {
           args = JSON.parse(tc.function.arguments || '{}')
         } catch {

@@ -1,0 +1,84 @@
+# template: workflow-creation
+name: workflow-creation
+description: 创建或重构 harness 工作流的流程（创建工作流的流程）。按 workflow-spec 规范产出自包含工作流（workflow.yaml + check 脚本 + templates）。
+
+# 工作流验证手段（测试手段定义，见 docs/workflow-spec.md）
+# workflow-check：校验工作流合法性（workflow.yaml 结构/sections/gate/verify 手段可解析）
+verify:
+  checks: [workflow-check]
+
+# 任务开始前
+pre_task:
+  - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+    action: init
+
+stages:
+  - name: designing
+    executor: subagent
+    skill: .harness/skills/workflow-creation/skill-design/SKILL.md
+    input: task.md
+    output: design.md
+    sections:
+      - [## Summary for downstream]
+      - [## Decision Log]
+    require_verify: false
+    permission: read-only
+    tools: read+bash
+    gate: user_approval
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: implementing
+    executor: subagent
+    skill: .harness/skills/workflow-creation/skill-implement/SKILL.md
+    input: [task.md, design.md]
+    output: changes.md
+    sections:
+      - [## Summary for downstream]
+    require_verify: false
+    permission: workspace-write
+    tools: code-mode
+    gate: none
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: testing
+    executor: subagent
+    skill: .harness/skills/workflow-creation/skill-test/SKILL.md
+    input: [task.md, design.md, changes.md]
+    output: test-report.md
+    sections:
+      - [## Summary for downstream]
+      - [## 完整性声明, ## Anti-Cherry-Pick Declaration]
+    require_verify: true
+    permission: workspace-write
+    tools: code-mode
+    gate: user_approval
+    on_fail: implementing
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: reflecting
+    executor: inline
+    skill: .harness/skills/framework/reflecting/SKILL.md
+    sub_command: reflect
+    input: [task.md, design.md, changes.md, test-report.md]
+    output: lessons-draft.md
+    sections: []
+    require_verify: false
+    permission: read-only
+    tools: read+bash
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: complete
+
+post_task:
+  - skill: .harness/skills/framework/reflecting/SKILL.md
+    sub_command: collect
+    trigger: manual

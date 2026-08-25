@@ -1,0 +1,84 @@
+# template: skill-creation
+name: skill-creation
+description: 创建或重构 harness 技能的工作流（非代码任务）
+
+# 工作流验证手段（测试手段定义，见 docs/workflow-spec.md）
+# skill-check：校验技能包结构（SKILL.md/frontmatter/引用完整性），无需项目代码命令
+verify:
+  checks: [skill-check]
+
+# 任务开始前
+pre_task:
+  - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+    action: init
+
+stages:
+  - name: designing
+    executor: subagent
+    skill: .harness/skills/skill-creation/skill-design/SKILL.md
+    input: task.md
+    output: design.md
+    sections:
+      - [## Summary for downstream]
+      - [## Decision Log]
+    require_verify: false
+    permission: read-only
+    tools: read+bash
+    gate: user_approval
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: implementing
+    executor: subagent
+    skill: .harness/skills/skill-creation/skill-implement/SKILL.md
+    input: [task.md, design.md]
+    output: changes.md
+    sections:
+      - [## Summary for downstream]
+    require_verify: false
+    permission: workspace-write
+    tools: code-mode
+    gate: none
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: testing
+    executor: subagent
+    skill: .harness/skills/skill-creation/skill-test/SKILL.md
+    input: [task.md, design.md, changes.md]
+    output: test-report.md
+    sections:
+      - [## Summary for downstream]
+      - [## 完整性声明, ## Anti-Cherry-Pick Declaration]
+    require_verify: true
+    permission: workspace-write
+    tools: code-mode
+    gate: user_approval
+    on_fail: implementing
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: save
+      - action: skill-log
+
+  - name: reflecting
+    executor: inline
+    skill: .harness/skills/framework/reflecting/SKILL.md
+    sub_command: reflect
+    input: [task.md, design.md, changes.md, test-report.md]
+    output: lessons-draft.md
+    sections: []
+    require_verify: false
+    permission: read-only
+    tools: read+bash
+    post_stage:
+      - skill: .harness/skills/framework/state-checkpoint/SKILL.md
+        action: complete
+
+post_task:
+  - skill: .harness/skills/framework/reflecting/SKILL.md
+    sub_command: collect
+    trigger: manual

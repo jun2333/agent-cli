@@ -1,22 +1,44 @@
 #!/usr/bin/env node
+import readline from 'readline'
 import OpenAI from 'openai'
 import { config } from './config.js'
 import { createTools } from './tools/index.js'
 import { runAgentLoop, type LoopEvent } from './agent/loop.js'
-import { TUI, type TUIHandlers } from './ui/tui.js'
+import { TUI, type TUIHandlers, type StatusKind } from './ui/tui.js'
+import {
+  loadSession,
+  saveSession,
+  ensureAgentCliDir,
+  loadUserPrompt,
+  loadMemory,
+  listSessions,
+  newSessionId,
+  acquireSessionLock,
+  releaseSessionLock,
+} from './session.js'
 
 const client = new OpenAI({
   apiKey: 'ollama',
   baseURL: config.ollamaBaseUrl,
 })
 
-const SYSTEM_PROMPT = `你是一个运行在终端里的通用编程助手，能执行 shell 命令、读写文件来完成用户的开发任务。
+// 内置默认提示词（用户可在 ~/.agent-cli/prompt.md 定义自己的根提示词覆盖它）。
+// 注意：不做格式/样式约束——样式由 TUI 渲染层统一决定，让模型自由发挥。
+const DEFAULT_SYSTEM_PROMPT = `你是一个运行在终端里的通用编程助手，能执行 shell 命令、读写文件来完成用户的开发任务。
 
 规则：
 - 需要执行命令、读写文件时，调用对应工具；可以多轮调用（先读再改再验证）
 - 回答简洁，用中文
 - 工具执行失败时，先看错误信息再决定下一步，不要盲目重试
 - 完成任务时，简要说明你做了什么和结果`
+
+/** 组装 system prompt：用户根提示词（若有）> 默认提示词，再追加用户 memory（若有） */
+function buildSystemPrompt(): string {
+  ensureAgentCliDir()
+  const base = loadUserPrompt() ?? DEFAULT_SYSTEM_PROMPT
+  const memory = loadMemory()
+  return memory ? `${base}\n\n# Memory\n${memory}` : base
+}
 
 const DIM = '\x1b[90m'
 const RESET = '\x1b[0m'
@@ -43,6 +65,93 @@ const HELP_TEXT = `命令：
   ↑ / ↓         历史输入
   ← / →         移动光标`
 
+/**
+ * 交互式选择要恢复的会话（--resume/-r）。
+ * TTY 下用箭头键单选列表；非 TTY 降级为数字输入。
+ * 被其他进程锁定的会话不可选。返回选中的会话 id；取消返回 null。
+ */
+async function selectSession(): Promise<string | null> {
+  const sessions = listSessions()
+  if (sessions.length === 0) {
+    console.log('No saved sessions.')
+    return null
+  }
+  // 仅可选未锁定的会话
+  const selectable = sessions.filter((s) => !s.locked)
+  if (selectable.length === 0) {
+    console.log('All sessions are locked by other running processes.')
+    return null
+  }
+
+  // 非 TTY（管道/脚本）：降级为数字选择
+  if (!process.stdin.isTTY) {
+    console.log('\nSaved sessions:')
+    sessions.forEach((s, i) => {
+      const time = new Date(s.updatedAt).toLocaleString()
+      const lock = s.locked ? ' [locked]' : ''
+      console.log(`  ${i + 1}. ${time}  ${s.messageCount} msgs${lock}`)
+    })
+    console.log('\n(locked 项不可选)')
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+    const answer = await new Promise<string>((resolve) => rl.question('\nSelect session (0 to cancel): ', resolve))
+    rl.close()
+    const n = parseInt(answer, 10)
+    if (!Number.isFinite(n) || n < 1 || n > sessions.length) return null
+    if (sessions[n - 1].locked) {
+      console.log('That session is locked by another process.')
+      return null
+    }
+    return sessions[n - 1].id
+  }
+
+  // TTY：箭头键单选列表（↑/↓ 只在可选项目间移动，locked 项显示但不可选）
+  return new Promise<string | null>((resolve) => {
+    let selected = 0
+    const draw = () => {
+      process.stdout.write('\x1b[2J\x1b[H') // 清屏 + 光标到顶部
+      process.stdout.write('Select a session to resume (↑/↓ move, Enter confirm, Esc/q cancel):\n\n')
+      sessions.forEach((s) => {
+        const time = new Date(s.updatedAt).toLocaleString()
+        const line = `${s.messageCount} msgs ${time}${s.locked ? ' [locked]' : ''}`
+        if (s.locked) {
+          process.stdout.write(`\x1b[90m  ${line}\x1b[0m\n`) // 灰色：不可选
+        } else {
+          const item = selectable.indexOf(s)
+          if (item === selected) process.stdout.write(`\x1b[7m▶ ${line}\x1b[0m\n`)
+          else process.stdout.write(`  ${line}\n`)
+        }
+      })
+      process.stdout.write('\nEsc/q: cancel')
+    }
+    const cleanup = (result: string | null) => {
+      process.stdin.removeListener('keypress', onKey)
+      process.stdin.setRawMode(false)
+      process.stdin.pause()
+      process.stdout.write('\x1b[2J\x1b[H')
+      resolve(result)
+    }
+    const onKey = (_str: string, key: any) => {
+      if (key.name === 'up') {
+        selected = (selected - 1 + selectable.length) % selectable.length
+        draw()
+      } else if (key.name === 'down') {
+        selected = (selected + 1) % selectable.length
+        draw()
+      } else if (key.name === 'return' || key.name === 'enter') {
+        // 真实终端发 \r → 'return'；PTY 下 \r 常被转成 \n → 'enter'，两者都要兼容
+        cleanup(selectable[selected].id)
+      } else if (key.name === 'escape' || key.name === 'q' || (key.ctrl && key.name === 'c')) {
+        cleanup(null)
+      }
+    }
+    readline.emitKeypressEvents(process.stdin)
+    process.stdin.setRawMode(true)
+    process.stdin.resume()
+    process.stdin.on('keypress', onKey)
+    draw()
+  })
+}
+
 function formatArgs(args: unknown): string {
   try {
     const s = JSON.stringify(args)
@@ -66,15 +175,17 @@ async function runTurn(
 
   let answer = ''
   let answerStarted = false
+  // LLM 事件阶段 → 状态栏（统一英文；tool_end 不更新，避免"正在运行"残留）
+  const phaseToStatus: Record<'llm_start' | 'tool_start', StatusKind> = {
+    llm_start: 'thinking',
+    tool_start: 'tool',
+  }
   const handle = (event: LoopEvent) => {
     switch (event.type) {
       case 'status':
-        if (event.phase === 'llm_start') {
-          ui?.addThinking()
-          ui?.setStatus('思考中…')
-        } else if (event.phase === 'tool_start') {
-          ui?.setStatus(`工具: ${event.name}…`)
-        }
+        if (!ui || event.phase === 'tool_end') break
+        if (event.phase === 'llm_start') ui.addThinking()
+        ui.setStatus(phaseToStatus[event.phase], event.phase === 'tool_start' ? event.name : undefined)
         break
       case 'reasoning':
         if (ui) {
@@ -87,7 +198,7 @@ async function runTurn(
         answer += event.content
         if (!answerStarted) {
           answerStarted = true
-          ui?.setStatus('回答中…')
+          ui?.setStatus('answering')
         }
         if (ui) ui.appendToLast(event.content)
         else process.stdout.write(`\x1b[1m${event.content}\x1b[0m`)
@@ -115,39 +226,81 @@ async function runTurn(
 
 function main() {
   const args = process.argv.slice(2)
+  // 组装 system prompt（用户根提示词 > 默认，追加 memory）
+  const systemPrompt = buildSystemPrompt()
 
   if (args[0] === '--version' || args[0] === '-v') {
     console.log('agent-cli 0.1.0')
     return
   }
   if (args[0] === '--help' || args[0] === '-h') {
-    console.log(`用法: agent-cli [问题]
+    console.log(`用法: agent-cli [选项] [问题]
 
-  agent-cli           进入交互模式
-  agent-cli "问题"     单轮问答后退出（便于脚本调用）
+  agent-cli              进入交互模式（自动恢复上次会话）
+  agent-cli -r           选择历史会话恢复
+  agent-cli "问题"        单轮问答后退出（便于脚本调用）
+
+选项：
+  -r, --resume  选择历史会话恢复
 
 ${HELP_TEXT}`)
     return
   }
 
+  const resumeFlag = args[0] === '--resume' || args[0] === '-r'
+
   // 非交互单轮模式：agent-cli "问题"
-  if (args.length > 0) {
+  if (args.length > 0 && !resumeFlag) {
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: args.join(' ') },
     ]
     runTurn(messages, null)
       .then(() => process.exit(0))
       .catch((e) => {
-        console.error('错误:', e.message)
+        console.error('Error:', e.message)
         process.exit(1)
       })
     return
   }
 
-  // === 交互模式：自研 DECSTBM TUI ===
+  // 交互模式：自研 DECSTBM TUI
+  void startInteractive(systemPrompt, resumeFlag)
+}
+
+async function startInteractive(systemPrompt: string, resumeFlag: boolean) {
+  ensureAgentCliDir()
+  // 会话 id 只存内存：默认新会话；--resume 则交互选择历史会话
+  let sessionId: string
+  let loaded: OpenAI.Chat.ChatCompletionMessageParam[] | null = null
+  if (resumeFlag) {
+    const chosenId = await selectSession()
+    if (chosenId) {
+      sessionId = chosenId
+      if (!acquireSessionLock(sessionId)) {
+        // 理论不会发生（列表已禁用被锁会话），防御处理
+        console.log(`Session ${sessionId} is locked by another process.`)
+        process.exit(1)
+      }
+      loaded = loadSession(sessionId)
+    } else {
+      sessionId = newSessionId()
+    }
+  } else {
+    sessionId = newSessionId()
+  }
+
   const ui = new TUI(BANNER)
-  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [{ role: 'system', content: SYSTEM_PROMPT }]
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: systemPrompt },
+    ...(loaded ?? []),
+  ]
+  // 统一退出：先释放会话锁再退出（保证解锁及时，异常退出靠 pid 探测兜底）
+  const exitApp = (code = 0) => {
+    releaseSessionLock(sessionId)
+    ui.exit()
+    process.exit(code)
+  }
   let running = false
   let queue: string[] = []
   let currentAbort: AbortController | null = null
@@ -155,20 +308,24 @@ ${HELP_TEXT}`)
   async function processMessage(text: string) {
     ui.addUserMessage(text)
     messages.push({ role: 'user', content: text })
+    saveSession(messages, sessionId) // 用户消息落盘
 
     running = true
     const ac = new AbortController()
     currentAbort = ac
     try {
       const answer = await runTurn(messages, ui, ac.signal)
-      if (answer) messages.push({ role: 'assistant', content: answer })
+      if (answer) {
+        messages.push({ role: 'assistant', content: answer })
+        saveSession(messages, sessionId) // 回答落盘
+      }
     } catch (e: any) {
       if (ac.signal.aborted) {
-        ui.addInfo('（已打断）')
-        ui.setStatus('已打断')
+        ui.addInfo('Interrupted.')
+        ui.setStatus('interrupted')
       } else {
-        ui.showError('错误: ' + e.message)
-        ui.setStatus('出错')
+        ui.showError('Error: ' + e.message)
+        ui.setStatus('error')
       }
     } finally {
       running = false
@@ -181,24 +338,24 @@ ${HELP_TEXT}`)
     if (running) return
     const next = queue.shift()
     if (next) {
-      ui.setStatus(`处理队列 (剩 ${queue.length})`)
+      ui.setStatus('queued', `(${queue.length} left)`)
       await processMessage(next)
     } else {
-      ui.setStatus('Ready')
+      ui.setStatus('ready')
     }
   }
 
   const handlers: TUIHandlers = {
     onEnter: (text) => {
       if (text === '/exit' || text === '/quit') {
-        ui.exit()
-        process.exit(0)
+        exitApp(0)
         return
       }
       if (text === '/clear') {
         messages.length = 1
         queue = []
         ui.clear()
+        saveSession(messages, sessionId) // 清空磁盘会话
         return
       }
       if (text === '/help') {
@@ -208,24 +365,32 @@ ${HELP_TEXT}`)
       if (running) {
         queue.push(text)
         ui.addUserMessage(text)
-        ui.addInfo('（已排队，当前任务完成后处理）')
+        ui.addInfo('Queued. Will run after the current task.')
       } else {
         void processMessage(text)
       }
     },
     onExit: () => {
-      ui.exit()
-      process.exit(0)
+      exitApp(0)
     },
     onInterrupt: () => {
       if (running && currentAbort) {
         currentAbort.abort()
-        ui.addInfo('（发送打断…）')
+        ui.addInfo('Sending interrupt…')
       }
     },
   }
 
   ui.enter(handlers)
+
+  // 注意：restoreHistory 必须在 ui.enter() 之后调用——
+  // enter() 内部会重置 blocks 为仅 banner，若先恢复历史会被覆盖
+  if (loaded && loaded.length > 0) {
+    ui.restoreHistory(loaded)
+    ui.addInfo(`Session ${sessionId}: ${loaded.length} messages.`)
+  } else {
+    ui.addInfo(`New session ${sessionId}.`)
+  }
 }
 
 main()

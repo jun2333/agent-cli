@@ -1,0 +1,10 @@
+{
+  "schema_version": "env-check.v1",
+  "checks": [
+    { "name": "node-version", "command": "node -v" },
+    { "name": "pnpm-available", "command": "pnpm -v" },
+    { "name": "deps-installed", "command": "test -d node_modules" },
+    { "name": "build-passes", "command": "pnpm build" }
+  ],
+  "timeout_ms": 120000
+}
