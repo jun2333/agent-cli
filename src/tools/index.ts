@@ -5,6 +5,8 @@ import { promisify } from 'util'
 import { glob as globFiles } from 'glob'
 import type { OpenAI } from 'openai'
 import { projectRoot, config } from '../config.js'
+import { agentCliDir, imageToDataUrl, resolveImagePath } from '../images.js'
+import { getCapabilities } from '../models.js'
 import { readMemoryIndex, readMemoryTopic, appendMemory, writeMemory } from '../session.js'
 
 const execAsync = promisify(exec)
@@ -130,6 +132,22 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'view_image',
+      description:
+        '读取并理解**尚未在对话中显示**的图片文件（需要当前模型支持视觉）。路径可为项目内的图片文件，或 ~/.agent-cli/images/ 下的图片（用户 Ctrl+V 粘贴的图片存放在这里）。' +
+        '⚠️ 若图片已随用户消息附带（你能直接看到图），请直接基于它回答，**不要**调用本工具，也不要凭空猜测路径。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '图片路径，如 docs/shot.png 或 ~/.agent-cli/images/20260916-112233-123.png' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'read_memory',
       description: '读取长期记忆：无 topic 返回记忆索引（类型 + 每条一句话摘要）；有 topic 返回对应类型记忆的完整内容。',
       parameters: {
@@ -173,8 +191,13 @@ export const toolDefinitions: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   },
 ]
 
-/** 工具执行结果：content 回传给 LLM */
-export type ToolResult = { content: string }
+/** 多模态内容部件（与 OpenAI ChatCompletionContentPart 对齐） */
+export type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
+/** 工具执行结果：content 回传给 LLM，支持纯文本或多模态数组（如图片） */
+export type ToolResult = { content: string | ContentPart[] }
 
 export type ToolImplementations = Record<string, (args: any) => Promise<ToolResult>>
 
@@ -197,6 +220,17 @@ function resolveSafe(p: string): { ok: true; resolved: string; relative: string 
     return { ok: false, error: `非法路径：不允许访问项目根目录之外的文件（${p}）` }
   }
   return { ok: true, resolved, relative: path.relative(projectRoot, resolved) }
+}
+
+/**
+ * 把开头的 `~` 展开为 **agent-cli 基址**（`AGENT_CLI_DIR` 或家目录，同 images.agentCliDir）：
+ * 图片目录在项目根之外，用户/LLM 常按 `~/images/x.png` 书写，而 `path.resolve` 不会展开 `~`
+ * （会被当成名为 `~` 的目录）。基址必须与 `imageDir()` 一致，否则设置 `AGENT_CLI_DIR` 后
+ * 工具描述承诺的路径会被白名单拒绝（审查发现 I-5）。展开后再交给 images.resolveImagePath 校验。
+ */
+function expandHome(p: string): string {
+  if (p === '~') return agentCliDir()
+  return p.startsWith('~/') ? path.join(agentCliDir(), p.slice(2)) : p
 }
 
 /** 递归遍历目录收集文本文件（跳过忽略目录、二进制、大文件） */
@@ -227,7 +261,26 @@ async function collectTextFiles(
   return results
 }
 
-export function createTools(): { definitions: typeof toolDefinitions; implementations: ToolImplementations } {
+/**
+ * createTools 的可选参数。
+ *
+ * `currentModel` 用于 `view_image` 的能力预检：运行时模型会被 `/model` 切换，
+ * 若工具内部直接读 `config.chatModel`，切换后预检就会按旧模型判断（切到无 vision 的模型仍放行，
+ * 反之误拒）。因此由调用方（`runTurn`）把本轮真实使用的模型**注入**进来，
+ * 保持「注入参数」而非「全局可变状态」——避免多轮/多会话之间互相污染。
+ */
+export type CreateToolsOptions = {
+  /** 当前运行时模型；缺省回落 `config.chatModel`（非交互单轮模式） */
+  currentModel?: string
+}
+
+export function createTools(opts: CreateToolsOptions = {}): {
+  definitions: typeof toolDefinitions
+  implementations: ToolImplementations
+} {
+  // 本轮的工具集绑定同一个模型值：view_image 预检读它，不再读 config.chatModel
+  const currentModel = opts.currentModel ?? config.chatModel
+
   const implementations: ToolImplementations = {
     bash: async ({ command }: { command: string }) => {
       if (typeof command !== 'string' || !command.trim()) {
@@ -411,6 +464,54 @@ export function createTools(): { definitions: typeof toolDefinitions; implementa
         }
       } catch (e: any) {
         return { content: JSON.stringify({ error: `搜索失败: ${e.message}` }) }
+      }
+    },
+
+    view_image: async ({ path: p }: { path: string }) => {
+      if (typeof p !== 'string' || !p.trim()) {
+        return { content: JSON.stringify({ error: 'path 参数必须是非空字符串' }) }
+      }
+
+      // 能力预检：探测失败（null = 能力未知）或明确无 vision 都直接拒绝，且不读取图片——
+      // 避免把图塞给不支持视觉的模型，导致上游报错或图片被静默丢弃。
+      // 用注入的运行时模型（/model 切换后立即生效），而非 config.chatModel。
+      const caps = await getCapabilities(currentModel)
+      if (!caps) {
+        return {
+          content: JSON.stringify({
+            error: `无法探测模型能力（${currentModel}）：Ollama 可能未启动或模型不存在，请确认后再试`,
+          }),
+        }
+      }
+      if (!caps.vision) {
+        return {
+          content: JSON.stringify({
+            error: `当前模型 ${currentModel} 不支持视觉（vision）能力，无法读取图片；可用 /model 切换到支持视觉的模型`,
+          }),
+        }
+      }
+
+      // 路径校验统一复用 images.resolveImagePath（项目根内 或 图片目录内），不另写一套
+      const safe = resolveImagePath(expandHome(p.trim()))
+      if (!safe.ok) return { content: JSON.stringify({ error: safe.error }) }
+
+      // 读取 + 大小校验（>10MB 拒绝）+ base64 编码为 data URL，全部由 images 承担
+      const encoded = imageToDataUrl(safe.abs)
+      if (!encoded.ok) {
+        // 真实用户反馈的失败链之一：图片已直投进用户消息，模型却仍想"再读一次"，
+        // 而直投消息里没有路径文本 → 它会**凭空猜一个路径**，这里报"不存在"后
+        // 又白花一轮去纠错。故在路径不存在时把它拉回正轨。
+        const hint = encoded.error.startsWith('图片不存在')
+          ? '。若该图已随用户消息附带（你能直接看到），请直接基于它回答，无需调用本工具'
+          : ''
+        return { content: JSON.stringify({ error: encoded.error + hint }) }
+      }
+
+      return {
+        content: [
+          { type: 'text', text: `图片 ${safe.display}（${encoded.bytes} 字节）如下：` },
+          { type: 'image_url', image_url: { url: encoded.url } },
+        ],
       }
     },
 

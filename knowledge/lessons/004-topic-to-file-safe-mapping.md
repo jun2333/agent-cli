@@ -2,8 +2,8 @@
 tags: [security, pattern, input-validation]
 confidence: 0.5
 created: 2026-08-25
-last_used: 2026-08-25
-use_count: 1
+last_used: 2026-09-16
+use_count: 2
 source_task: 002
 status: active
 invalidation_condition: "当引入更严格的路径安全机制（如路径 allowlist）时失效"
