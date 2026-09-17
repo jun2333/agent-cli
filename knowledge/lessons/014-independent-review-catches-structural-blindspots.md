@@ -2,8 +2,8 @@
 tags: [process, review, quality-gate]
 confidence: 0.5
 created: 2026-09-16
-last_used: 2026-09-16
-use_count: 1
+last_used: 2026-09-17
+use_count: 2
 source_task: 004
 status: active
 invalidation_condition: "当审查者与实现者共享同一上下文/同一心智模型（例如同一代理自审）时，本条价值大幅下降——这正是要求『独立 + 换人』的原因"

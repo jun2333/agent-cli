@@ -2,8 +2,8 @@
 tags: [text-processing, unicode, off-by-one]
 confidence: 0.5
 created: 2026-09-16
-last_used: 2026-09-16
-use_count: 1
+last_used: 2026-09-17
+use_count: 2
 source_task: 004
 status: active
 invalidation_condition: "当输入框改为动态高度、不再需要折叠时，本条的阈值本身失效；但『统计口径统一 + 认所有行尾』的原则仍适用于任何文本处理"

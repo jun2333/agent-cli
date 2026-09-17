@@ -2,8 +2,8 @@
 tags: [harness, workflow, convention]
 confidence: 0.5
 created: 2026-08-25
-last_used: 2026-09-16
-use_count: 2
+last_used: 2026-09-17
+use_count: 3
 source_task: 002
 status: active
 invalidation_condition: "当 harness 的 sections 校验改为模糊匹配时失效"

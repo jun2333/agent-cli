@@ -2,8 +2,8 @@
 tags: [testing, integration, mock, real-environment]
 confidence: 0.5
 created: 2026-09-16
-last_used: 2026-09-16
-use_count: 1
+last_used: 2026-09-17
+use_count: 2
 source_task: 004
 status: active
 invalidation_condition: "当项目引入完整的容器化集成测试环境并把 OS 依赖纳入 CI 后，手工 PTY 冒烟的必要性下降；但『注入式 mock 不能替代真实环境』的判断仍成立"

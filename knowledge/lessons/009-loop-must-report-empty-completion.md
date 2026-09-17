@@ -2,8 +2,8 @@
 tags: [agent-loop, error-handling, observability]
 confidence: 0.5
 created: 2026-09-16
-last_used: 2026-09-16
-use_count: 1
+last_used: 2026-09-17
+use_count: 2
 source_task: 004
 status: active
 invalidation_condition: "当上游模型/网关开始保证『任何结束都带明确原因且不出现空产出』，或项目改用带内建截断上报的 agent 框架时，本条紧迫性下降"

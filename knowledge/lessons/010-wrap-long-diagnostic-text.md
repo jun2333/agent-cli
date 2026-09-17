@@ -2,8 +2,8 @@
 tags: [tui, rendering, error-message, testing]
 confidence: 0.5
 created: 2026-09-16
-last_used: 2026-09-16
-use_count: 1
+last_used: 2026-09-17
+use_count: 2
 source_task: 004
 status: active
 invalidation_condition: "当渲染层改为对错误/提示文本自动折行时，本条第①点不再需要人工处理；第②点的断言方式仍建议沿用"

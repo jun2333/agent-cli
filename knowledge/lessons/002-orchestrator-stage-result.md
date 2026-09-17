@@ -2,8 +2,8 @@
 tags: [harness, orchestrator, workflow]
 confidence: 0.5
 created: 2026-08-25
-last_used: 2026-08-25
-use_count: 2
+last_used: 2026-09-17
+use_count: 3
 source_task: 001
 status: active
 invalidation_condition: "当 harness 的 stage-result 协议或 core.js validate/advance/approve 命令行为变更时失效"

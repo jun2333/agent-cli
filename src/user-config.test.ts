@@ -96,3 +96,36 @@ describe('用户配置路径', () => {
     expect(existsSync(join(custom, 'config.json'))).toBe(true)
   })
 })
+
+describe('trustedHooks（FR-8 / AC-46/47 的信任记录）', () => {
+  const entry = { hash: 'abc123', trustedAt: '2026-09-17T00:00:00.000Z' }
+
+  it('trustedHooks 往返一致（合并保存保留 model/thinkLevel）', () => {
+    saveUserConfig({ model: 'qwen3:8b', thinkLevel: 'low' })
+    saveUserConfig({ model: 'qwen3:8b', thinkLevel: 'low', trustedHooks: { '/repo': entry } })
+    expect(loadUserConfig()).toEqual({
+      model: 'qwen3:8b',
+      thinkLevel: 'low',
+      trustedHooks: { '/repo': entry },
+    })
+  })
+
+  it('trustedHooks 非对象（数组）→ 字段被丢弃', () => {
+    writeFileSync(configPath(), JSON.stringify({ model: 'm', trustedHooks: ['x'] }))
+    const cfg = loadUserConfig()
+    expect(cfg.model).toBe('m')
+    expect(cfg.trustedHooks).toBeUndefined()
+  })
+
+  it('trustedHooks 条目缺 hash / trustedAt 非字符串 → 字段被丢弃', () => {
+    writeFileSync(configPath(), JSON.stringify({ trustedHooks: { '/repo': { hash: 'h', trustedAt: 42 } } }))
+    expect(loadUserConfig().trustedHooks).toBeUndefined()
+    writeFileSync(configPath(), JSON.stringify({ trustedHooks: { '/repo': { trustedAt: 't' } } }))
+    expect(loadUserConfig().trustedHooks).toBeUndefined()
+  })
+
+  it('合法与非法键混合 → 整体忽略（白名单校验不做部分收录）', () => {
+    writeFileSync(configPath(), JSON.stringify({ trustedHooks: { '/ok': entry, '': entry } }))
+    expect(loadUserConfig().trustedHooks).toBeUndefined()
+  })
+})

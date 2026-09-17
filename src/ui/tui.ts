@@ -16,7 +16,13 @@
  *   contentRows+2            输入框上边框
  *   contentRows+3..+5        输入框内容窗口（3 行，随光标自动滚动）
  *   contentRows+6            输入框下边框
- *   contentRows+7..rows      预留区
+ *   contentRows+7..rows      预留区（FR-5 内联浮层 / FR-4 补全菜单画在这里；平时 3 行）
+ *
+ * 预留区是**动态**的：交互浮层或补全菜单打开时 `reservedRows()` 从 3 扩展到它自己的高度，
+ * `contentRows` 相应收缩，内容区从 `blocks` 整区重建（D5）。两者都不进滚动区 → 不污染滚动历史。
+ *
+ * ⚠️ 补全菜单的高度在其生命周期内**恒定**（V-5）：候选数变化只改行内容、不改行数，
+ * 因此打字过程中的过滤**不触发整区重建**（只重绘预留区），只在菜单出现/消失时各重建一次。
  *
  * 职责边界：输入缓冲的全部编辑语义（原子删除、跨行光标、折行、折叠）都在
  * `ui/input-buffer.ts` 里（纯逻辑、可单测）；本文件只做两件事——
@@ -25,17 +31,41 @@
 import { existsSync } from 'fs'
 import { join } from 'path'
 import readline from 'readline'
+import { config } from '../config.js'
 import type { ContentPart } from '../tools/index.js'
 import { readClipboardImage, readClipboardText } from '../clipboard.js'
 import { editInExternalEditor } from '../editor.js'
 import { imageDir, resolveImagePath } from '../images.js'
 import { InputBuffer } from './input-buffer.js'
 import { Selector, type SelectorItem } from './selector.js'
+import { StatusMachine, Ticker, spinnerFrame, type StatusEvent, type StatusKind, type StatusView } from './status-machine.js'
+// 交互浮层（FR-5）：渲染行与键位语义都在 overlay.ts（纯逻辑）；本文件只负责画到预留区
+import {
+  createOverlay,
+  handleOverlayKey,
+  overlayHeight,
+  renderOverlay as renderOverlayLines,
+  type OverlayModel,
+} from './overlay.js'
+import type { InteractionSpec, OverlayResult } from '../interaction.js'
+// 斜杠补全（FR-4）：候选菜单的状态/键位/渲染都在 completion-menu.ts（纯逻辑）；
+// 本文件只负责画进预留区与把按键路由过去。`commands.js` 只取类型（TUI 不负责造源，index 注入）。
+import type { CompletionRegistry } from '../commands.js'
+import {
+  createCompletionMenu,
+  handleMenuKey,
+  isCompletionTrigger,
+  renderCompletionMenu as renderCompletionMenuLines,
+  updateQuery,
+  type CompletionMenuState,
+} from './completion-menu.js'
 // 纯文本函数与它们用到的样式常量都在 text.ts（见该文件头注释：避免 input-buffer ↔ tui 循环导入）
 import { CODE, RESET, displayWidth, inlineMarkdown, tailByWidth, truncateTo, wrapText } from './text.js'
 
 // 重新导出纯文本函数：既有调用方（selector.ts、tui-format.test.ts 等）从 './tui.js' 导入的行为不变
 export { displayWidth, wrapText, truncateTo, tailByWidth, inlineMarkdown } from './text.js'
+// StatusKind 的唯一来源是 status-machine（AC-1）；这里只做转出，既有导入点（index.ts / e2e）零改动
+export type { StatusKind, StatusView, StatusEvent } from './status-machine.js'
 
 // === SGR 样式（Select Graphic Rendition：\x1b[<n>m 设置文本样式） ===
 // 前景色层次（代码写死，不靠提示词约束；暗 → 亮：思考 < 回答 < 强调）：
@@ -64,35 +94,41 @@ const CHA = (col: number) => `\x1b[${col}G` // Cursor Horizontal Absolute：光�
 const BRACKET_PASTE_ON = '\x1b[?2004h'
 const BRACKET_PASTE_OFF = '\x1b[?2004l'
 
-// === 状态栏：状态类型 → 文案 + 颜色（统一英文） ===
-export type StatusKind =
-  | 'ready'
-  | 'thinking'
-  | 'tool'
-  | 'answering'
-  | 'queued'
-  | 'interrupted'
-  | 'error'
-
-const STATUS_STYLE: Record<StatusKind, { text: string; color: string }> = {
-  ready: { text: 'Ready', color: GREEN },
-  thinking: { text: 'Thinking…', color: YELLOW },
-  tool: { text: 'Running tool', color: CYAN },
-  answering: { text: 'Answering…', color: CYAN },
-  queued: { text: 'Queued', color: CYAN },
-  interrupted: { text: 'Interrupted', color: YELLOW },
-  error: { text: 'Error', color: RED },
+// === 状态栏：状态类型 → 颜色（文案由 StatusMachine 提供，见 status-machine.ts） ===
+const STATUS_COLOR: Record<StatusKind, string> = {
+  ready: GREEN,
+  thinking: YELLOW,
+  tool: CYAN,
+  answering: CYAN,
+  queued: CYAN,
+  interrupted: YELLOW,
+  error: RED,
 }
 
 // === 消息块模型 ===
+
+/** 工具行状态：running 由 tick 原地刷新 spinner；done/failed/denied 为结束态（D16） */
+type ToolLineState = 'running' | 'done' | 'failed' | 'denied'
+
 type MsgBlock =
   | { type: 'banner'; lines: string[] }
   | { type: 'user'; text: string }
   | { type: 'assistant'; text: string; outputCount: number }
   | { type: 'thinking'; full: string; done: boolean }
-  // tool 块有两个来源：addToolLine（单行工具调用，渲染带 `[tool] ` 前缀）与
-  // addInfo（多行说明文本，逐行渲染且无前缀）。info 标记区分二者，避免前缀/拆行语义错配。
-  | { type: 'tool'; text: string; info?: boolean }
+  // info：多行说明文本（原 addToolLine/addInfo 中的 addInfo 分支），逐行渲染且无前缀
+  | { type: 'info'; text: string }
+  // tool：工具行。开始时即渲染 running（带 spinner），完成后**同一行原地更新**为完成态
+  //（AC-3/D16）。logicalRow 用于"逻辑行 → 物理行"映射，已滚出视口时跳过更新（边界 B5）。
+  | {
+      type: 'tool'
+      id: string
+      name: string
+      argsText: string
+      state: ToolLineState
+      summary?: string
+      startedAt: number
+      logicalRow: number
+    }
   | { type: 'error'; text: string }
 
 // === 工具函数 ===
@@ -168,8 +204,44 @@ export type SelectorOptions = {
 
 export class TUI {
   private blocks: MsgBlock[] = []
-  private status: StatusKind = 'ready'
-  private statusDetail = ''
+  /**
+   * 状态栏的**唯一数据源**（AC-1）：本类不再自己持有 status 字段，
+   * 所有写入都经 `applyStatus(view)`；`setStatus` 只是写状态机的兼容 facade（Decision 9）。
+   */
+  private readonly statusMachine: StatusMachine
+  /** 最近一次应用的渲染数据（renderStatus 消费它） */
+  private statusView: StatusView
+  /**
+   * 全项目**唯一**的定时器（100ms，AC-4）：只在 running 相位启动，idle 立即停止。
+   * tick 只重绘状态栏 1 行（+ 可选 1 行运行中工具行），绝不整区重绘。
+   */
+  private readonly ticker: Ticker
+  /** 当前运行中的工具行 id（tick 时原地刷新它；结束时置空） */
+  private runningToolId: string | null = null
+  /**
+   * 交互浮层（FR-5）：非 null 时接管按键并占用预留区。
+   * 打开/关闭都会改变 `contentRows` → 必须**整区重建**（见 relayoutForOverlay），不能增量改滚动区。
+   */
+  private interactiveOverlay: OverlayModel | null = null
+  /** 挂起中的浮层 resolver：浮层关闭（提交/取消）时 resolve，退出收尾时按 cancelled 结算 */
+  private overlayResolver: ((r: OverlayResult) => void) | null = null
+  /**
+   * 斜杠补全候选源（FR-4）：由入口编排注入（`setCompletionRegistry`），未注入时 `/` 不弹菜单。
+   * P4 技能系统只需往同一个 registry 注册一个 `skills` 源即可让技能进候选（AC-23 的扩展点）。
+   */
+  private completionRegistry: CompletionRegistry | null = null
+  /**
+   * 补全菜单（FR-4）：非 null 时接管 ↑↓/Tab/Enter/Esc 并占用预留区。
+   * 其 `height` 在生命周期内恒定（V-5）→ 查询变化只重绘预留区，**不**改 `contentRows`。
+   */
+  private completionMenu: CompletionMenuState | null = null
+  /**
+   * 补全菜单的"代"计数：打开/关闭都递增，让在途的异步 `collect()` 结果失效。
+   * 没有它的话，快速输入（多个并发的 `collect()`）会让过期结果覆盖最新查询。
+   */
+  private completionSeq = 0
+  /** ASCII spinner 兜底（Braille 字体不支持时用 `|/-\`，见兼容性 NFR） */
+  private readonly asciiSpinner: boolean
   /** 状态栏尾部的「模型/思考等级」，由上层注入 */
   private modelInfo = ''
   /** 输入缓冲（原子模型，纯逻辑模块）：多行/粘贴折叠/图片原子都在这里 */
@@ -202,6 +274,12 @@ export class TUI {
 
   constructor(banner: string[]) {
     this.BANNER = banner
+    // ASCII 兜底：Braille 帧依赖字体支持，无可靠探测手段 → 提供显式开关（兼容性 NFR）
+    this.asciiSpinner = process.env.AGENT_CLI_ASCII_SPINNER === '1'
+    this.statusMachine = new StatusMachine()
+    this.statusMachine.asciiSpinner = this.asciiSpinner
+    this.statusView = this.statusMachine.render(Date.now())
+    this.ticker = new Ticker(() => this.onTick())
     this.onResizeBound = () => this.onResize()
     this.onKeypressBound = (str, key) => this.onKeypress(str, key)
   }
@@ -227,10 +305,24 @@ export class TUI {
   }
 
   exit() {
+    // 唯一定时器必须先停（AC-4：退出后不得残留 interval）
+    this.ticker.stop()
+    // 释放挂起中的浮层 Promise（否则 awaiting 的 broker/executor 永久悬挂）；退出路径不重绘
+    const pending = this.overlayResolver
+    this.overlayResolver = null
+    this.interactiveOverlay = null
+    pending?.({ kind: 'cancelled' })
+    // 补全菜单无 Promise 桥，直接丢弃；递增 seq 让在途的 collect() 结果失效（退出后不得再画）
+    this.completionMenu = null
+    this.completionSeq++
     process.stdout.removeListener('resize', this.onResizeBound)
     process.stdin.removeListener('keypress', this.onKeypressBound)
     // 关闭 bracketed paste，避免退出后把终端留给下个程序时行为异常
     process.stdout.write(BRACKET_PASTE_OFF + CURSOR_SHOW + ALT_SCREEN_EXIT)
+    // 真清屏（D12/AC-15）：`?1049l` 会让终端恢复**进入 TUI 之前**的主屏内容，
+    // 因此清屏必须发生在 ALT_SCREEN_EXIT **之后**——顺序不可换，否则清掉的是 alt screen 的
+    // 残留、恢复出来的旧主屏内容仍在（用户会看到退出前的终端历史，而不是干净的一行 bye）。
+    process.stdout.write(ERASE_DISPLAY + ERASE_SCROLLBACK + CUP(1, 1))
   }
 
   private syncSize() {
@@ -238,8 +330,20 @@ export class TUI {
     const r = process.stdout.rows
     if (c) this.cols = c
     if (r) this.rows = r
-    // 计算逻辑不变：输入框固定高度，contentRows 不随输入内容行数变化
-    this.contentRows = Math.max(1, this.rows - INPUT_ROWS - STATUS_ROWS - RESERVED_ROWS)
+    // 逻辑不变：输入框固定高度；`contentRows` 只随"预留区实际占用行数"变化。
+    // 预留区平时就是 RESERVED_ROWS=3（既有布局常量不变）；浮层打开时按浮层高度扩张，
+    // 内容区相应收缩（D5："动态占行、内容区收缩"）。blocks 是唯一真源 → 重建不丢内容。
+    this.contentRows = Math.max(1, this.rows - INPUT_ROWS - STATUS_ROWS - this.reservedRows())
+  }
+
+  /**
+   * 预留区实际行数：`max(既有 3 行, 浮层高度, 补全菜单高度)`。
+   * 补全菜单的 height 在其生命周期内恒定（V-5）→ 打字过滤时这里不会变，因此不会反复整区重建。
+   */
+  private reservedRows(): number {
+    const overlay = this.interactiveOverlay ? overlayHeight(this.interactiveOverlay, this.cols) : 0
+    const menu = this.completionMenu ? this.completionMenu.height : 0
+    return Math.max(RESERVED_ROWS, overlay, menu)
   }
 
   private onResize() {
@@ -358,6 +462,26 @@ export class TUI {
     return `${DIM}${stateText} ${ellipsis}${tail}${RESET}`
   }
 
+  /**
+   * 工具行的单行渲染（D16）：
+   * - 运行中：`⠋ bash npm run build`（带参数，让用户知道在跑什么）
+   * - 完成：`✓ bash 12.3s · 输出 143 行`（**不再重复参数**，长输出不展示全文）
+   * 帧由 `startedAt` 派生（无内部计数器）→ 全量重绘与 tick 原地更新得到同一结果。
+   */
+  private toolLineText(b: Extract<MsgBlock, { type: 'tool' }>): string {
+    const tail = b.summary ? ` ${b.summary}` : ''
+    switch (b.state) {
+      case 'running':
+        return `${DIM}${spinnerFrame(Date.now() - b.startedAt, this.asciiSpinner)} ${b.name}${b.argsText ? ` ${b.argsText}` : ''}${RESET}`
+      case 'done':
+        return `${DIM}✓ ${b.name}${tail}${RESET}`
+      case 'failed':
+        return `${RED}✗ ${b.name}${tail}${RESET}`
+      case 'denied':
+        return `${YELLOW}⊘ ${b.name}${tail || '（权限拒绝）'}${RESET}`
+    }
+  }
+
   /** blocks → 渲染行（带样式） */
   private flattenBlocks(): string[] {
     const out: string[] = []
@@ -394,18 +518,15 @@ export class TUI {
         case 'thinking':
           out.push(this.thinkingLines(b))
           break
-        case 'tool':
+        case 'info':
           // 必须按 \n 拆行：addInfo 塞入的是多行文本，整段当作一个元素 push 时内嵌换行会被
           // truncateTo 原样写出（LF 只下移不回车），全量重绘后呈阶梯状错乱（N-5，与 'error' 同类）。
-          if (b.info) {
-            // addInfo：逐行、无前缀、跳过空行 —— 与 addInfo 的增量 appendLine 写法一致
-            for (const l of b.text.split('\n')) {
-              if (l.trim()) out.push(`${DIM}${l}${RESET}`)
-            }
-          } else {
-            // addToolLine：单行带 `[tool] ` 前缀（多行时逐行加，避免内嵌换行破坏排版）
-            for (const l of b.text.split('\n')) out.push(`${DIM}[tool] ${l}${RESET}`)
+          for (const l of b.text.split('\n')) {
+            if (l.trim()) out.push(`${DIM}${l}${RESET}`)
           }
+          break
+        case 'tool':
+          out.push(this.toolLineText(b))
           break
         case 'error':
           // 错误消息可能很长且含可操作建议（如截断提示里的 /model、OLLAMA_CONTEXT_LENGTH）。
@@ -558,9 +679,8 @@ export class TUI {
 
   /** 状态栏完整文本（含颜色）；尾部追加「模型/等级」，超长时截断模型部分而不挤掉状态文本 */
   private statusLineText(): string {
-    const s = STATUS_STYLE[this.status]
-    const text = this.statusDetail ? `${s.text} ${this.statusDetail}` : s.text
-    const head = `${s.color}● ${text}${RESET}`
+    const text = this.statusView.text
+    const head = `${STATUS_COLOR[this.statusView.kind]}● ${text}${RESET}`
     if (!this.modelInfo) return head
     const sep = ' · '
     const avail = this.cols - displayWidth(`● ${text}`) - displayWidth(sep)
@@ -572,6 +692,48 @@ export class TUI {
     this.cursorTo(this.statusRow())
     this.clearLine()
     this.write(this.statusLineText())
+  }
+
+  /**
+   * 状态栏的**唯一写入口**（AC-1 的"单一状态源"）。
+   * 依据 `view.animating` 启停唯一定时器；`statusTickMaxRows >= 2` 时额外刷一次
+   * 运行中的工具行（V-3 裁决：tick 最多重绘 2 行，都是单行原位更新，绝不整区重绘）。
+   */
+  applyStatus(view: StatusView) {
+    this.statusView = view
+    if (view.animating) this.ticker.start()
+    else this.ticker.stop()
+    this.renderStatus()
+    if (config.statusTickMaxRows >= 2) this.renderRunningToolLine()
+    this.positionInputCursor()
+  }
+
+  /** 状态机事件入口（由 index 的 loop 事件回调驱动）：迁移 → 应用渲染数据 */
+  transitionStatus(event: StatusEvent) {
+    this.statusMachine.transition(event)
+    this.applyStatus(this.statusMachine.render(Date.now()))
+  }
+
+  /**
+   * 状态机 facade（Decision 9）：保留既有签名/语义，内部**只经状态机**写（静态相位，不带动画）。
+   * 目的：既有调用点（index.ts 的 queued/ready/error/interrupted）与 e2e 断言零改动。
+   */
+  setStatus(kind: StatusKind, detail?: string) {
+    this.statusMachine.setStatic(kind, detail ?? '')
+    this.applyStatus(this.statusMachine.render(Date.now()))
+  }
+
+  /** 只读出口，供 AC-4 断言"idle 时无活动定时器" */
+  get statusTimerActive(): boolean {
+    return this.ticker.isActive
+  }
+
+  /**
+   * 唯一定时器的回调（AC-4/AC-65）：只重绘状态栏（+ 可选 1 行运行中工具行），
+   * **绝不**调用 `rerenderToBottom()`（整区重绘会与流式输出打架、并让滚动历史抖动）。
+   */
+  private onTick() {
+    this.applyStatus(this.statusMachine.render(Date.now()))
   }
 
   private renderFixed() {
@@ -601,6 +763,11 @@ export class TUI {
       this.clearLine()
     }
 
+    // 浮层与预留区共用同一坐标系：清理必须在浮层重绘**之前**（否则会把浮层擦掉）。
+    // 浮层（模态交互）与补全菜单（输入辅助）互斥：同一时刻只会有一个占用预留区，
+    // 用 else 显式表达，避免两者同时非空时互相覆盖。
+    if (this.interactiveOverlay) this.renderInteractionOverlay()
+    else this.renderCompletionMenuLines()
     this.positionInputCursor()
   }
 
@@ -626,14 +793,8 @@ export class TUI {
     this.write(botBorder)
 
     this.positionInputCursor()
-  }
-
-  setStatus(kind: StatusKind, detail?: string) {
-    if (this.status === kind && this.statusDetail === (detail ?? '')) return
-    this.status = kind
-    this.statusDetail = detail ?? ''
-    this.renderStatus()
-    this.positionInputCursor()
+    // 输入文本变化后同步补全菜单：已开则按新文本过滤/关闭，未开则不动（打开只走键入路径）
+    this.refreshCompletion()
   }
 
   /** 注入状态栏尾部的「当前模型/思考等级」（如 `qwen3-vl:8b-thinking/low`）；level 省略时只显示模型名 */
@@ -692,6 +853,224 @@ export class TUI {
     this.selectorOptions = null
     if ('cancelled' in r) opts.onCancel()
     else opts.onPick(r.picked)
+  }
+
+  // === 交互浮层（FR-5 / Decision 2） ===
+
+  /**
+   * 打开内联浮层，返回在浮层关闭（提交或 Esc）时 resolve 的 Promise。
+   *
+   * 渲染位置：**预留区**（输入框下边框之下），不进 `blocks`、不进滚动区 → 不污染滚动历史、
+   * 不产生滚动。浮层出现时预留区扩张、`contentRows` 收缩，内容区从 `blocks` 重建。
+   *
+   * 浮层期间按键**独占路由**（Esc/↑↓/Enter/y/n/Tab/可打印字符全部被消费，不进输入缓冲）——
+   * 与既有 `mode === 'selector'` 的全屏模态接管同构（Decision 8）。
+   * 同一时刻只允许一个浮层：已有浮层时先把旧的按取消结算（design「浮层不嵌套」）。
+   */
+  openInteractionOverlay(spec: InteractionSpec): Promise<OverlayResult> {
+    // 全屏选择器接管期间不接受浮层：两者布局模型互斥（选择器铺满全屏、没有预留区概念）。
+    // 该组合在当前编排下不可达（/model 在 agent 运行期间被拒，而浮层只在运行期间打开），
+    // 但宁可让交互安全失败，也不要在模态之上叠加浮层造成滚动区错乱（fail-closed）。
+    if (this.mode === 'selector') return Promise.resolve({ kind: 'cancelled' })
+    if (this.interactiveOverlay) this.closeInteractionOverlay({ kind: 'cancelled' })
+    // 浮层是模态交互：它接管键盘后补全菜单不再可用，直接丢弃（不单独重建——下面的
+    // relayoutForOverlay 会一并生效），避免"半截 `/` 输入"与审批浮层争夺预留区。
+    this.completionMenu = null
+    this.completionSeq++
+    this.interactiveOverlay = createOverlay(spec, this.cols)
+    this.relayoutForOverlay()
+    return new Promise<OverlayResult>((resolve) => {
+      this.overlayResolver = resolve
+    })
+  }
+
+  /** 释放挂起中的浮层（`InteractionBroker.cancelAll()` 的出口，退出收尾用）；无浮层时 no-op */
+  cancelInteractionOverlay() {
+    if (this.interactiveOverlay) this.closeInteractionOverlay({ kind: 'cancelled' })
+  }
+
+  /**
+   * 关闭浮层并把界面恢复（清预留区、`contentRows` 复原），最后 resolve 挂起的 Promise。
+   * 顺序（先重建界面再回调）与 `onSelectorKey` 一致：回调里可能立刻打开下一个浮层/选择器。
+   */
+  private closeInteractionOverlay(result: OverlayResult) {
+    const resolve = this.overlayResolver
+    this.overlayResolver = null
+    this.interactiveOverlay = null
+    this.relayoutForOverlay()
+    resolve?.(result)
+  }
+
+  /**
+   * 浮层开关引起的布局变化 → **整区重建**。
+   *
+   * ⚠️ 这里刻意**复用 `onResize()`** 的既有循环（清屏 + 清历史 + 从 blocks 重建 +
+   * 重设 DECSTBM），而不是"只改滚动区、增量重绘"：`contentRows` 变化后终端滚动区的
+   * 历史映射全部失效，增量更新会让内容错位/滚动撕裂（本项目最脆弱的路径，R3/B1 交接项）。
+   * 既有工具块的 `logicalRow` 在全屏选择器接管期间可能漂移，整区重建从 blocks 重算
+   * `outputRows`，因此不依赖任何残留行号。
+   */
+  private relayoutForOverlay() {
+    this.onResize()
+  }
+
+  /** 按键交给浮层；`consumed` 时只重绘浮层（不整区重绘），否则关闭浮层并结算结果 */
+  private onOverlayKey(str: string, key: any) {
+    const m = this.interactiveOverlay
+    if (!m) return
+    const r = handleOverlayKey(m, str, key)
+    if (r === 'consumed') {
+      this.renderInteractionOverlay()
+      this.positionInputCursor()
+      return
+    }
+    if ('cancel' in r) this.closeInteractionOverlay({ kind: 'cancelled' })
+    else this.closeInteractionOverlay(r.submit as OverlayResult)
+  }
+
+  /**
+   * 只写预留区：从 `reservedFrom()` 起逐行 CUP + EL + write（与 renderFixed 的预留区清理同一坐标系）。
+   * 不触碰滚动区、不重设滚动区 → 浮层本身的重绘是"1~height 行"的局部写。
+   */
+  private renderInteractionOverlay() {
+    const m = this.interactiveOverlay
+    if (!m) return
+    const lines = renderOverlayLines(m, this.cols)
+    const from = this.reservedFrom()
+    const reserved = this.reservedRows()
+    for (let i = 0; i < reserved; i++) {
+      this.cursorTo(from + i)
+      this.clearLine()
+      if (i < lines.length) this.write(truncateTo(lines[i], this.cols))
+    }
+  }
+
+  // === 斜杠补全（FR-4 / AC-19~22，V-5） ===
+
+  /**
+   * 注入补全候选源（入口编排调用）。未注入时 `/` 不会弹菜单 ——
+   * 这让既有测试里的裸 `new TUI(banner)` 行为完全不变。
+   */
+  setCompletionRegistry(registry: CompletionRegistry) {
+    this.completionRegistry = registry
+  }
+
+  /**
+   * 输入变化后的菜单同步：菜单**已开** → 按新文本过滤，或文本不再满足触发条件时关闭；
+   * 菜单**未开** → 什么都不做（打开只由 `maybeOpenCompletion()` 发起）。
+   *
+   * ⚠️ 刻意不在这里打开：历史回填（↑↓）等**程序化**替换文本的路径也走 `renderInput()`，
+   * 若在这里打开，Esc 关闭菜单后按 ↑ 取到一条 `/` 开头的历史命令就会立刻重开菜单，
+   * 后续 ↑↓ 又被菜单吃掉 —— 直接违反 AC-22（"关闭后 ↑↓ 恢复为历史导航"）。
+   *
+   * 过滤**不改 height**（V-5）→ 只重绘预留区，不触发整区重建。
+   */
+  private refreshCompletion() {
+    const m = this.completionMenu
+    if (!m) return
+    const text = this.buffer.toText()
+    if (!isCompletionTrigger(text)) {
+      this.closeCompletionMenu()
+      return
+    }
+    updateQuery(m, text.slice(1))
+    this.renderCompletionMenuLines()
+    this.positionInputCursor()
+  }
+
+  /**
+   * 用户**键入**导致输入变化后，按需打开菜单（仅这一条路径可以打开，见 refreshCompletion）。
+   * 候选源为空（未注入/无候选）时不弹空菜单。
+   */
+  private maybeOpenCompletion() {
+    if (this.completionMenu) return
+    if (this.mode === 'selector' || this.interactiveOverlay) return
+    const text = this.buffer.toText()
+    if (!isCompletionTrigger(text)) return
+    void this.openCompletionMenu()
+  }
+
+  /**
+   * 打开菜单并**整区重建一次**（V-5 允许的两次重建之一）。
+   *
+   * 两个关键点：
+   * 1. **候选源只在打开时收集一次**并缓存进 `CompletionMenuState.items`，整个菜单生命周期
+   *    不再重新收集（design §7）。这是高度恒定的前提：若每次查询变化都重收集，候选总数变化
+   *    会改 height → 每次打字都整区重建。
+   * 2. `completionSeq` 防竞态：`collect()` 可能是异步的（P4 扫盘），期间用户可能继续输入或已提交。
+   *    await 之后**重新校验**触发条件与代次，过期结果直接丢弃。
+   */
+  private async openCompletionMenu() {
+    const seq = ++this.completionSeq
+    const items = this.completionRegistry ? await this.completionRegistry.collect() : []
+    if (seq !== this.completionSeq) return
+    if (this.completionMenu) return
+    if (this.mode === 'selector' || this.interactiveOverlay) return
+    const text = this.buffer.toText()
+    if (!isCompletionTrigger(text)) return // 期间已提交/被改写
+    if (items.length === 0) return
+    this.completionMenu = createCompletionMenu(items)
+    updateQuery(this.completionMenu, text.slice(1))
+    this.relayoutForOverlay() // 整区重建 #1（菜单出现）
+  }
+
+  /** 关闭菜单并整区重建一次（V-5 允许的两次重建之二）；无菜单时 no-op */
+  private closeCompletionMenu() {
+    if (!this.completionMenu) return
+    this.completionMenu = null
+    this.completionSeq++ // 让在途的 collect() 结果失效
+    this.relayoutForOverlay() // 整区重建 #2（菜单消失）
+  }
+
+  /**
+   * 按键路由给补全菜单。返回 true = 已消费；false = 交回既有输入处理。
+   *
+   * ⚠️ 必须把可打印字符 / Ctrl+J / Alt+Enter 放行（`handleMenuKey` 返回 `'pass'`）：
+   * 菜单打开时用户仍在继续输入查询串，吞掉字符会让过滤永远不生效。
+   * 键位形状（`/` 无 name、Ctrl+J 的 name 也是 'enter'）见 completion-menu.ts 文件头。
+   */
+  private onCompletionMenuKey(str: string, key: any): boolean {
+    const m = this.completionMenu
+    if (!m) return false
+    const r = handleMenuKey(m, str, key)
+    if (r === 'pass') return false
+    if (r === 'consumed') {
+      this.renderCompletionMenuLines()
+      this.positionInputCursor()
+      return true
+    }
+    if ('close' in r) {
+      // AC-22：只关菜单，**不动输入缓冲**（输入保留）
+      this.closeCompletionMenu()
+      return true
+    }
+    if ('fill' in r) {
+      // AC-21：Tab 只填入，不提交。填入后关闭菜单（用户已做出选择）
+      this.setInputText(r.fill)
+      this.closeCompletionMenu()
+      return true
+    }
+    // AC-21：Enter 执行选中项 —— 填入后走既有 handleSubmit 路径（命令表匹配/入队/发消息）
+    const h = this.handlers
+    this.setInputText(r.execute)
+    this.closeCompletionMenu()
+    const v = this.submit()
+    if (v && h) h.onEnter(v)
+    return true
+  }
+
+  /** 只写预留区（与 renderInteractionOverlay 同一坐标系；菜单行数 = reservedRows() 内） */
+  private renderCompletionMenuLines() {
+    const m = this.completionMenu
+    if (!m) return
+    const lines = renderCompletionMenuLines(m, this.cols)
+    const from = this.reservedFrom()
+    const reserved = this.reservedRows()
+    for (let i = 0; i < reserved; i++) {
+      this.cursorTo(from + i)
+      this.clearLine()
+      if (i < lines.length) this.write(truncateTo(lines[i], this.cols))
+    }
   }
 
   // === 业务方法 ===
@@ -764,14 +1143,70 @@ export class TUI {
     this.renderThinkingPanel(last)
   }
 
-  addToolLine(line: string) {
-    this.blocks.push({ type: 'tool', text: line })
-    this.appendLine(`${DIM}[tool] ${line}${RESET}`)
+  /**
+   * 工具行**开始即渲染**（AC-3）：由 loop 的 `tool_start`（在 `await fn` 之前 emit）驱动。
+   * 记下 logicalRow 供完成后原地更新（不重新 append，避免同一工具出现两行）。
+   */
+  beginToolLine(id: string, name: string, argsText: string) {
+    const block: Extract<MsgBlock, { type: 'tool' }> = {
+      type: 'tool',
+      id,
+      name,
+      argsText,
+      state: 'running',
+      startedAt: Date.now(),
+      logicalRow: this.outputRows + 1,
+    }
+    this.blocks.push(block)
+    this.runningToolId = id
+    this.appendLine(this.toolLineText(block))
     this.renderFixed()
   }
 
+  /**
+   * 工具行完成态**原地更新**（AC-3/D16）：同行变 `✓ bash 12.3s · 输出 143 行`。
+   * 已滚出视口（logicalToPhysical 为 null）时跳过——不强求重建滚动历史（边界 B5）。
+   */
+  endToolLine(id: string, ok: boolean, durationMs: number, outputLines: number) {
+    const block = this.findToolBlock(id)
+    if (!block) return
+    block.state = ok ? 'done' : 'failed'
+    block.summary = `${(durationMs / 1000).toFixed(1)}s · 输出 ${outputLines} 行`
+    if (this.runningToolId === id) this.runningToolId = null
+    this.updateToolLine(block)
+    this.positionInputCursor()
+  }
+
+  /** 按 id 找最近一个工具块（同一 id 只会有一个；从后往前找保证拿到最新的） */
+  private findToolBlock(id: string): Extract<MsgBlock, { type: 'tool' }> | undefined {
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      const b = this.blocks[i]
+      if (b.type === 'tool' && b.id === id) return b
+    }
+    return undefined
+  }
+
+  /**
+   * 原地重绘一行工具行（用逻辑行→物理行映射定位，多轮滚动后仍精确）。
+   * 不在这里复位输入光标：调用方（applyStatus / endToolLine）统一负责，省掉每 tick 的冗余写入。
+   */
+  private updateToolLine(b: Extract<MsgBlock, { type: 'tool' }>) {
+    const p = this.logicalToPhysical(b.logicalRow)
+    if (p === null) return // 已滚出视口
+    this.cursorTo(p)
+    this.clearLine()
+    this.write(truncateTo(this.toolLineText(b), this.cols))
+  }
+
+  /** tick 用：只刷新"当前运行中"的那一行工具行（spinner 帧变化，V-3 的第 2 行） */
+  private renderRunningToolLine() {
+    if (!this.runningToolId) return
+    const b = this.findToolBlock(this.runningToolId)
+    if (b) this.updateToolLine(b)
+  }
+
   addInfo(text: string) {
-    this.blocks.push({ type: 'tool', text, info: true })
+    this.blocks.push({ type: 'info', text })
     for (const l of text.split('\n')) {
       if (l.trim()) this.appendLine(`${DIM}${l}${RESET}`)
     }
@@ -787,6 +1222,7 @@ export class TUI {
 
   clear() {
     this.blocks = [{ type: 'banner', lines: this.BANNER }]
+    this.runningToolId = null
     // clearScreen=true：清屏 + 清滚动历史，彻底重开（否则旧内容和历史会残留）
     this.rerender(0, true)
   }
@@ -794,6 +1230,7 @@ export class TUI {
   /** 从磁盘历史恢复渲染（重启恢复会话用）。tool/tool_calls 消息跳过，只渲染 user/assistant 文本。 */
   restoreHistory(items: { role: string; content?: unknown }[]) {
     this.blocks = [{ type: 'banner', lines: this.BANNER }]
+    this.runningToolId = null
     for (const item of items) {
       if (item.role === 'user') {
         // 含图消息的 content 是部件数组，用 historyTextOf 取占位符文本（不内联渲染图片）
@@ -861,13 +1298,14 @@ export class TUI {
       this.pasting = false
       const pasted = this.pasteBuf
       this.pasteBuf = ''
-      // 选择器接管期间整段丢弃：既不路由给选择器、也不污染输入缓冲（N-2）
-      if (this.mode === 'selector') return
+      // 模态接管期间整段丢弃：既不路由给选择器/浮层、也不污染输入缓冲（N-2）
+      if (this.mode === 'selector' || this.interactiveOverlay) return
       if (pasted) {
         // 统一在 paste-end 做折叠判定：无论 readline 是一次性给整段还是逐字符给，
         // 折叠阈值（>3 行 / >200 字符）都能正确生效
         this.buffer.insertPaste(pasted)
         this.renderInput()
+        this.maybeOpenCompletion()
       }
       return
     }
@@ -892,6 +1330,23 @@ export class TUI {
     if (key.ctrl && key.name === 'c') {
       h.onExit()
       return
+    }
+
+    // 交互浮层接管：Esc/↑↓/Enter/y/n/Tab/可打印字符全部被浮层消费，不进输入缓冲（Decision 8）。
+    // 顺序：在 paste 守卫与 Ctrl+C 之后（粘贴数据与全局退出不得被浮层吃掉），
+    // 在既有 escape/↑↓/Enter 语义之前（否则 Esc 会去打断 agent、↑↓ 会去翻历史）。
+    if (this.interactiveOverlay) {
+      this.onOverlayKey(str, key)
+      return
+    }
+
+    // 补全菜单接管（FR-4）：↑↓/Tab/Enter/Esc 归菜单；可打印字符 / Ctrl+J / Alt+Enter 由
+    // `handleMenuKey` 返回 'pass' → 继续走既有输入处理（菜单打开时用户仍在输入查询串）。
+    // 顺序：在 paste 守卫与 Ctrl+C 之后（粘贴数据与全局退出不得被菜单吃掉），
+    // 在 overlay 之后（浮层是模态交互，优先级更高），在既有 escape/↑↓/Enter 语义之前
+    //（否则 Esc 会去打断 agent、↑↓ 会去翻历史 —— AC-22 的反例）。
+    if (this.completionMenu) {
+      if (this.onCompletionMenuKey(str, key)) return
     }
 
     // 选择器接管：按键全部路由给选择器，不进入输入缓冲
@@ -929,6 +1384,7 @@ export class TUI {
     if (key.name === 'backspace') {
       this.buffer.backspace()
       this.renderInput()
+      this.maybeOpenCompletion()
       return
     }
 
@@ -970,6 +1426,8 @@ export class TUI {
         } else {
           this.buffer.insertText(ch)
           this.renderInput()
+          // 用户键入是唯一能打开补全菜单的路径（见 refreshCompletion 的注释：历史回填不得打开）
+          this.maybeOpenCompletion()
         }
       }
     }
@@ -981,6 +1439,7 @@ export class TUI {
     if (r.ok) {
       this.buffer.insertImage(r.name, r.path)
       this.renderInput()
+      this.maybeOpenCompletion()
       return
     }
     if (r.reason === 'no-image') {
@@ -988,6 +1447,7 @@ export class TUI {
       if (text) {
         this.buffer.insertPaste(text)
         this.renderInput()
+        this.maybeOpenCompletion()
       }
       return
     }
@@ -1020,6 +1480,7 @@ export class TUI {
       })
       this.inputScrollTop = 0
       this.renderInput()
+      this.maybeOpenCompletion()
       return
     }
     if (r.reason === 'error') {

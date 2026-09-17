@@ -1,11 +1,32 @@
 import type OpenAI from 'openai'
-import type { ToolImplementations, ToolResult } from '../tools/index.js'
+import { classifyToolResult, type ToolImplementations, type ToolResult } from '../tools/index.js'
 
+/**
+ * Agent loop 的事件契约（B1 修正版，唯一版本）。
+ *
+ * 与改动前的差异（这三处正是"状态栏不实时"的根因）：
+ * - `tool_start` **只 emit 一次**且在 `await fn(args)` **之前**，必带 `callId/name/args`
+ *   （旧实现 emit 两次，第二次不带 name → 上层把工具名清空，AC-2 的反例）；
+ * - `tool_end` 不再被忽略，携带耗时/输出行数/字节（旧实现根本没有它，
+ *   导致"Running tool"残留到下一次 llm_start）；
+ * - 删除 `tool` 事件（它在工具**执行完之后**才 emit → 工具行滞后）。
+ *   工具行改由 `tool_start`/`tool_end` 驱动，做到"开始执行即渲染 + 完成后原地更新"。
+ */
 export type LoopEvent =
-  | { type: 'status'; phase: 'llm_start' | 'tool_start' | 'tool_end'; name?: string }
+  | { type: 'status'; phase: 'llm_start' }
   | { type: 'reasoning'; content: string }
   | { type: 'token'; content: string }
-  | { type: 'tool'; name: string; args: unknown }
+  | { type: 'tool_start'; callId: string; name: string; args: unknown }
+  | {
+      type: 'tool_end'
+      callId: string
+      name: string
+      ok: boolean
+      durationMs: number
+      outputLines: number
+      outputBytes: number
+      error?: string
+    }
   | { type: 'error'; message: string }
 
 /**
@@ -37,9 +58,7 @@ type LoopOptions = {
 /**
  * Agent Loop：LLM 决定调工具 → 执行 → 结果回传 → 直到无工具调用。
  *
- * 产出事件流：
- * - token：模型生成的流式文本（工具决策轮与最终回答轮都会产出）
- * - tool：每次工具执行完成后产出
+ * 产出事件流见 `LoopEvent`（tool_start 在工具执行前、tool_end 在执行后，成对出现）。
  */
 export async function* runAgentLoop(opts: LoopOptions): AsyncGenerator<LoopEvent> {
   const { messages, definitions, implementations, client, model, maxIterations = 5, signal, think } = opts
@@ -116,28 +135,47 @@ export async function* runAgentLoop(opts: LoopOptions): AsyncGenerator<LoopEvent
 
     // 逐个执行工具，结果回传
     for (const tc of toolCalls) {
-      yield { type: 'status', phase: 'tool_start', name: tc.function.name }
-      const fn = implementations[tc.function.name]
-      let result: ToolResult
+      const callId = tc.id
+      const name = tc.function.name
       let args: unknown = {}
-
-      if (fn) {
-        yield { type: 'status', phase: 'tool_start' }
-        try {
-          args = JSON.parse(tc.function.arguments || '{}')
-        } catch {
-          args = { _error: '参数解析失败' }
-        }
-        try {
-          result = await fn(args)
-        } catch (e: any) {
-          result = { content: JSON.stringify({ error: `工具执行失败: ${e.message}` }) }
-        }
-      } else {
-        result = { content: JSON.stringify({ error: `未知工具: ${tc.function.name}` }) }
+      try {
+        args = JSON.parse(tc.function.arguments || '{}')
+      } catch {
+        args = { _error: '参数解析失败' }
       }
 
-      yield { type: 'status', phase: 'tool_end' }
+      // ⚠️ 必须在 `await fn(args)` **之前** emit，且**只 emit 一次**。
+      // 旧实现在此处与下方各 emit 一次 `tool_start`，第二次不带 name → 上层把状态栏的
+      // 工具名清成空（AC-2 的根因）；改由本事件驱动 TUI 的 beginToolLine（AC-3）。
+      yield { type: 'tool_start', callId, name, args }
+
+      const startedAt = Date.now()
+      const fn = implementations[name]
+      let result: ToolResult
+      try {
+        result = fn ? await fn(args) : { content: JSON.stringify({ error: `未知工具: ${name}` }) }
+      } catch (e: any) {
+        result = { content: JSON.stringify({ error: `工具执行失败: ${e.message}` }) }
+      }
+
+      // ok/行数/字节：优先用 executor 给出的结构化字段（FR-7 落地后），
+      // 否则由 classifyToolResult 从 content 兜底判定（既有 12 个 impl 只返回 content）。
+      const fallback = classifyToolResult(result.content)
+      const ok = result.ok ?? fallback.ok
+      const outputLines = result.lines ?? fallback.outputLines
+      const outputBytes = result.bytes ?? fallback.outputBytes
+
+      yield {
+        type: 'tool_end',
+        callId,
+        name,
+        ok,
+        durationMs: Date.now() - startedAt,
+        outputLines,
+        outputBytes,
+        ...(fallback.error === undefined ? {} : { error: fallback.error }),
+      }
+
       messages.push({
         role: 'tool',
         tool_call_id: tc.id,
@@ -146,7 +184,6 @@ export async function* runAgentLoop(opts: LoopOptions): AsyncGenerator<LoopEvent
         // 类型只声明了文本 part → 必须断言。上游类型补齐后可移除该断言。
         content: result.content as OpenAI.Chat.Completions.ChatCompletionToolMessageParam['content'],
       })
-      yield { type: 'tool', name: tc.function.name, args }
     }
   }
 

@@ -2,8 +2,8 @@
 tags: [ollama, capability-probe, design-assumption]
 confidence: 0.5
 created: 2026-09-16
-last_used: 2026-09-16
-use_count: 1
+last_used: 2026-09-17
+use_count: 2
 source_task: 004
 status: active
 invalidation_condition: "当 Ollama 在 /v1 上支持 num_ctx，或项目改用原生 /api/chat 后，本条的具体结论失效；『参数是否生效要实测』的方法论不变"

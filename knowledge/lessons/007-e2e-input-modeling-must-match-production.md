@@ -2,8 +2,8 @@
 tags: [testing, tui, terminal, e2e]
 confidence: 0.5
 created: 2026-09-16
-last_used: 2026-09-16
-use_count: 1
+last_used: 2026-09-17
+use_count: 2
 source_task: 004
 status: active
 invalidation_condition: "当项目不再用 readline 解析按键（改为直接解析 stdin 字节流，或引入 ink/blessed 等框架）时，本条的具体事件形状结论失效；但『模拟输入形状须与生产一致』这一原则仍成立"

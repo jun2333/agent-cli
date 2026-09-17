@@ -2,8 +2,8 @@
 tags: [security, path-traversal, fix-regression]
 confidence: 0.5
 created: 2026-09-16
-last_used: 2026-09-16
-use_count: 1
+last_used: 2026-09-17
+use_count: 2
 source_task: 004
 status: active
 invalidation_condition: "当项目把路径校验下沉到统一中间件（所有文件访问强制走 safe-fs 层）后，本条的具体做法被该机制取代"

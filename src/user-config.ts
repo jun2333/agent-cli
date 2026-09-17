@@ -16,13 +16,18 @@ export type UserConfig = {
   model?: string
   /** 思考等级（缺省 'low'） */
   thinkLevel?: 'low' | 'medium' | 'high' | 'max'
+  /**
+   * Hook 信任记录（FR-8/AC-46/47）：项目根 → 配置内容哈希 + 信任时间。
+   * 命令变了哈希变化 → 需重新信任；键固定为 projectRoot（代码生成，不含用户/LLM 输入）。
+   */
+  trustedHooks?: Record<string, { hash: string; trustedAt: string }>
 }
 
 /** 合法的思考等级（服务端全局固定四档，无 per-model 元数据） */
 const THINK_LEVELS = ['low', 'medium', 'high', 'max']
 
-/** ~/.agent-cli 根目录（运行时读取，方便测试隔离） */
-const agentCliDir = () => process.env.AGENT_CLI_DIR || join(homedir(), '.agent-cli')
+/** ~/.agent-cli 根目录（运行时读取，方便测试隔离；导出供 hooks.json 等同基址文件复用） */
+export const agentCliDir = () => process.env.AGENT_CLI_DIR || join(homedir(), '.agent-cli')
 
 /** 用户配置文件路径 */
 function userConfigPath(): string {
@@ -45,6 +50,27 @@ export function loadUserConfig(): UserConfig {
     // 手改配置可能写出非法等级，此处白名单校验，非法值直接丢弃
     if (typeof raw.thinkLevel === 'string' && THINK_LEVELS.includes(raw.thinkLevel)) {
       cfg.thinkLevel = raw.thinkLevel as UserConfig['thinkLevel']
+    }
+    // trustedHooks 形状校验（FR-8）：整体或任一条目不合法 → 忽略该字段（损坏不阻断启动）
+    if (raw.trustedHooks !== undefined) {
+      if (raw.trustedHooks && typeof raw.trustedHooks === 'object' && !Array.isArray(raw.trustedHooks)) {
+        const entries = Object.entries(raw.trustedHooks as Record<string, unknown>)
+        const valid = entries.every(
+          ([k, v]) =>
+            k.trim() !== '' &&
+            v !== null &&
+            typeof v === 'object' &&
+            !Array.isArray(v) &&
+            typeof (v as Record<string, unknown>).hash === 'string' &&
+            (v as Record<string, unknown>).hash !== '' &&
+            typeof (v as Record<string, unknown>).trustedAt === 'string',
+        )
+        if (valid) cfg.trustedHooks = entries.reduce<Record<string, { hash: string; trustedAt: string }>>((acc, [k, v]) => {
+          const rec = v as { hash: string; trustedAt: string }
+          acc[k] = { hash: rec.hash, trustedAt: rec.trustedAt }
+          return acc
+        }, {})
+      }
     }
     return cfg
   } catch {

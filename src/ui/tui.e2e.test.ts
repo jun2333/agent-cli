@@ -19,6 +19,10 @@
  * - 模态选择器：接管期间按键不进输入缓冲，选中/取消后界面完整恢复
  * - 状态栏显示模型与等级（超长截断不挤掉状态文本）
  * - 原有交互回归：单行输入、历史上下、命令透传
+ * - 斜杠补全（FR-4）：`/` 弹菜单并列出全部内置命令、过滤+选中重置、Tab 只填入、Enter 执行、
+ *   Esc 关闭保留输入且 ↑↓ 恢复历史导航、**V-5 固定高度**（候选 10→3→1 时行数与 contentRows 不变）
+ * - 技能候选（AC-23 / V-6）：真实 `createSkillCompletionSource()` 扫临时目录的 `SKILL.md` →
+ *   技能与内置命令并列出现在菜单、格式不符的文件被跳过且告警、既有 V-5 高度契约不被破坏
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { EventEmitter } from 'events'
@@ -27,8 +31,16 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import type { ContentPart } from '../tools/index.js'
 import { setClipboardDeps, resetClipboardDeps } from '../clipboard.js'
+import { config } from '../config.js'
 import { TUI, displayWidth } from './tui.js'
 import { TermSim } from '../testing/term-sim.js'
+import {
+  CompletionRegistry,
+  createBuiltinSource,
+  type CommandSpec,
+  type CompletionCandidate,
+} from '../commands.js'
+import { createSkillCompletionSource } from '../skills.js'
 
 /**
  * Ctrl+G 假编辑器：真起 $EDITOR 会阻塞且依赖本机 VSCode，故在模块层替换。
@@ -224,6 +236,21 @@ describe('TUI 端到端：终端状态恢复（AC-17，I-11）', () => {
     expect(out).toContain('\x1b[?2004l')
     // 关闭必须发生在开启之后，否则退出时终端仍处于 bracketed paste 模式
     expect(out.lastIndexOf('\x1b[?2004l')).toBeGreaterThan(out.indexOf('\x1b[?2004h'))
+  })
+
+  it('AC-15：exit() 在 ALT_SCREEN_EXIT 之后真清屏（2J + 3J + CUP(1,1)），顺序不可换', () => {
+    ui.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+    ui.exit()
+
+    const out = rawWrites.join('')
+    const altExit = out.lastIndexOf('\x1b[?1049l')
+    const clear = out.lastIndexOf('\x1b[2J\x1b[3J')
+    expect(altExit).toBeGreaterThanOrEqual(0)
+    // 清屏必须在 `?1049l` **之后**：`?1049l` 会恢复进入 TUI 之前的主屏内容，
+    // 若先清屏再退出 alt screen，用户看到的仍是被恢复的旧内容（D12 的"真清屏"落空）。
+    expect(clear).toBeGreaterThan(altExit)
+    // 清屏后光标归位左上角：bye 才会落在第一行（AC-15 的"只剩一行 bye"）
+    expect(out.slice(clear)).toContain('\x1b[1;1H')
   })
 })
 
@@ -1008,3 +1035,717 @@ describe('TUI 端到端：模态选择器', () => {
     expect(term.contains('banner-line-1')).toBe(true)
   })
 })
+
+/**
+ * FR-1：状态栏状态机 + 工具行实时化（AC-2/AC-3/AC-4/AC-65）。
+ *
+ * 这里验证的是 TUI 这一侧的行为（状态机本身在 status-machine.test.ts 穷举）；
+ * "事件时序正确"（tool_start 在 await 之前唯一 emit）在 loop.test.ts 与 index.e2e.test.ts 验证。
+ */
+describe('TUI 端到端：状态栏状态机与工具行（FR-1）', () => {
+  it('AC-2：状态栏进入 tool 相位后显示 Running <工具名>（不再被清空）', () => {
+    ui.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+    ui.transitionStatus({ type: 'tool_start', name: 'bash' })
+    expect(term.row(STATUS_ROW)).toContain('Running bash')
+    // 连续第二次 tool_start（不同工具）名字被覆盖，不残留旧名
+    ui.transitionStatus({ type: 'tool_start', name: 'read' })
+    expect(term.row(STATUS_ROW)).toContain('Running read')
+    expect(term.row(STATUS_ROW)).not.toContain('bash')
+  })
+
+  it('AC-3：工具行开始即渲染，完成后**同一物理行**原地变完成态（含耗时与输出行数）', () => {
+    ui.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+    ui.addUserMessage('跑构建')
+    ui.transitionStatus({ type: 'tool_start', name: 'bash' })
+    ui.beginToolLine('call_1', 'bash', 'npm run build')
+
+    // ① 执行期间已有该行（旧实现要等工具跑完才渲染）
+    const during = term.dump()
+    const rowDuring = during.findIndex((l) => l.includes('bash npm run build'))
+    expect(rowDuring).toBeGreaterThanOrEqual(0)
+    expect(during[rowDuring]).not.toContain('✓') // 运行中：spinner + 命令，无完成标记
+
+    // ② 完成后同行原地更新（D16：完成态不再重复参数，改为耗时与输出行数）
+    ui.endToolLine('call_1', true, 12300, 143)
+    const after = term.dump()
+    expect(after[rowDuring]).toContain('✓ bash 12.3s · 输出 143 行')
+    // 屏幕上该工具行只有一条（不是新增一行），且运行态的参数已被完成态取代
+    expect(after.filter((l) => l.includes('bash npm run build'))).toHaveLength(0)
+    expect(after.filter((l) => l.includes('✓ bash 12.3s'))).toHaveLength(1)
+  })
+
+  it('AC-3：工具失败时同行变 ✗ 完成态（不新增行）', () => {
+    ui.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+    ui.beginToolLine('c9', 'bash', 'exit 1')
+    const rowRunning = term.dump().findIndex((l) => l.includes('exit 1'))
+    expect(rowRunning).toBeGreaterThanOrEqual(0)
+
+    ui.endToolLine('c9', false, 500, 2)
+
+    const after = term.dump()
+    expect(after[rowRunning]).toContain('✗ bash 0.5s · 输出 2 行')
+    expect(after.filter((l) => l.includes('✗ bash'))).toHaveLength(1)
+  })
+
+  it('AC-3 边界：工具行已滚出视口时结束更新跳过（不报错、不影响画面）', () => {
+    ui.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+    ui.beginToolLine('old', 'bash', 'ancient-command')
+    // 灌入大量内容把工具行挤出视口
+    for (let i = 0; i < 40; i++) ui.appendToLast(`填充行 ${i} 用于把工具行挤出视口。`)
+    expect(term.dump().some((l) => l.includes('ancient-command'))).toBe(false)
+
+    expect(() => ui.endToolLine('old', true, 100, 1)).not.toThrow()
+    expect(term.dump().some((l) => l.includes('ancient-command'))).toBe(false)
+  })
+
+  it('AC-4：idle 无活动定时器；running 启动；静态状态与 reset 都停止；exit 必停', () => {
+    ui.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+    expect(ui.statusTimerActive).toBe(false) // ready = idle
+
+    ui.transitionStatus({ type: 'llm_start' })
+    expect(ui.statusTimerActive).toBe(true) // thinking = running
+
+    ui.setStatus('queued', '(1 left)') // 静态相位不计时
+    expect(ui.statusTimerActive).toBe(false)
+
+    ui.transitionStatus({ type: 'tool_start', name: 'bash' })
+    expect(ui.statusTimerActive).toBe(true)
+
+    ui.transitionStatus({ type: 'tool_end' })
+    expect(ui.statusTimerActive).toBe(true) // thinking（AC-6：不回 Ready）
+
+    ui.transitionStatus({ type: 'reset' })
+    expect(ui.statusTimerActive).toBe(false) // 一轮结束 → idle
+
+    ui.transitionStatus({ type: 'tool_start', name: 'bash' })
+    expect(ui.statusTimerActive).toBe(true)
+    ui.exit()
+    expect(ui.statusTimerActive).toBe(false)
+  })
+
+  it('AC-65：tick 只重绘 ≤2 行、无清屏、无 DECSTBM 重建（并记录实测数字）', () => {
+    ui.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+    ui.transitionStatus({ type: 'tool_start', name: 'bash' })
+    ui.beginToolLine('c1', 'bash', 'npm run build')
+
+    const countIn = (s: string, re: RegExp) => (s.match(re) ?? []).length
+    const decstbmBefore = countIn(rawWrites.join(''), /\x1b\[1;\d+r/g)
+
+    const TICKS = 50
+    const startWrite = rawWrites.length
+    const t0 = performance.now()
+    for (let i = 0; i < TICKS; i++) (ui as any).onTick()
+    const elapsedMs = performance.now() - t0
+
+    const joined = rawWrites.slice(startWrite).join('')
+    const eraseLines = countIn(joined, /\x1b\[K/g) // 每 ERASE_LINE ≈ 重绘 1 行
+    const decstbmAfter = countIn(rawWrites.join(''), /\x1b\[1;\d+r/g)
+
+    // 每个 tick 重绘 2 行（状态栏 + 运行中工具行），上限 2×TICKS
+    expect(eraseLines).toBeLessThanOrEqual(2 * TICKS)
+    expect(eraseLines).toBeGreaterThanOrEqual(TICKS)
+    // 绝不做清屏 / 整区重绘
+    expect(joined).not.toContain('\x1b[2J')
+    expect(joined).not.toContain('\x1b[3J')
+    // 绝不重发 DECSTBM（滚动区重建）
+    expect(decstbmAfter).toBe(decstbmBefore)
+
+    // 实测数字（记录进 changes.md，供 AC-65 的"量出数字"要求）
+    console.log(
+      `[AC-65] TICKS=${TICKS} 写入调用=${rawWrites.length - startWrite} ERASE_LINE=${eraseLines} ` +
+        `平均每 tick ${(eraseLines / TICKS).toFixed(2)} 行 / ${(elapsedMs / TICKS).toFixed(3)}ms 单次`,
+    )
+  })
+
+  it('AC-65（V-3 开关）：statusTickMaxRows=1 时 tick 只重绘状态栏 1 行', () => {
+    ui.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+    ui.transitionStatus({ type: 'tool_start', name: 'bash' })
+    ui.beginToolLine('c1', 'bash', 'npm run build')
+
+    const original = config.statusTickMaxRows
+    config.statusTickMaxRows = 1
+    try {
+      const TICKS = 20
+      const startWrite = rawWrites.length
+      for (let i = 0; i < TICKS; i++) (ui as any).onTick()
+      const eraseLines = (rawWrites.slice(startWrite).join('').match(/\x1b\[K/g) ?? []).length
+      expect(eraseLines).toBe(TICKS) // 仅状态栏
+    } finally {
+      config.statusTickMaxRows = original
+    }
+  })
+
+  it('兼容性：AGENT_CLI_ASCII_SPINNER=1 时用 ASCII 帧（Braille 不可用仍可读）', () => {
+    const prev = process.env.AGENT_CLI_ASCII_SPINNER
+    process.env.AGENT_CLI_ASCII_SPINNER = '1'
+    const asciiUi = new TUI(BANNER)
+    try {
+      asciiUi.enter({ onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} })
+      asciiUi.beginToolLine('a1', 'bash', 'echo hi')
+      const row = term.dump().find((l) => l.includes('echo hi')) ?? ''
+      expect(row).toMatch(/^[|/\\-] bash echo hi$/)
+      expect(row).not.toMatch(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/) // 不含 Braille 帧
+    } finally {
+      asciiUi.exit()
+      if (prev === undefined) delete process.env.AGENT_CLI_ASCII_SPINNER
+      else process.env.AGENT_CLI_ASCII_SPINNER = prev
+    }
+  })
+})
+
+/**
+ * FR-5：内联交互浮层（AC-25 / AC-26）。
+ *
+ * 渲染位置：**预留区**（输入框下边框之下，24 行终端下为 22~24 行）。浮层不进 `blocks`、
+ * 不进滚动区 → 不污染滚动历史；打开/关闭改 `contentRows`，走**整区重建**（复用 onResize）。
+ *
+ * ⚠️ 键位事件形状来自真实 `readline.emitKeypressEvents` 探针（lesson 007 / D-7），
+ * 见 `overlay.ts` 文件头形状表；**不得**用"整段字符串当单个 keypress"或凭直觉构造：
+ * - 箭头 / Esc / 粘贴事件的 `str` 是 **undefined**（不是空串），`sequence` 才是转义序列；
+ * - lone Esc 的 `meta` 是 **true**（探针实测），任何"按 meta 过滤"的写法都会误判它。
+ */
+describe('TUI 端到端：内联交互浮层（FR-5 / AC-25 / AC-26）', () => {
+  /** 预留区首行（输入框下边框的下一行）：随 contentRows 动态变化（浮层会收缩内容区） */
+  const RESERVED_TOP = INPUT_BOT + 1
+  const overlayHandlers = { onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} }
+
+  /** 发出真实形状的"无 str"按键（箭头/Esc/粘贴）：str 在生产中是 undefined，不是空串 */
+  function pressBare(name: string, extra: Record<string, unknown> = {}) {
+    ;(process.stdin as any).emit('keypress', undefined, {
+      name,
+      ctrl: false,
+      shift: false,
+      meta: false,
+      sequence: '',
+      ...extra,
+    })
+  }
+  const pressEsc = () => pressBare('escape', { meta: true, sequence: '\x1b' })
+  const pressUp = () => pressBare('up', { sequence: '\x1b[A' })
+  const pressDown = () => pressBare('down', { sequence: '\x1b[B' })
+  const pressTab = () => press('\t', 'tab', { sequence: '\t' })
+  const pressEnter = () => press('\r', 'return')
+  const contentRowsOf = () => (ui as any).contentRows as number
+  /** 预留区首行 = contentRows + 状态栏(1) + 输入框(5) + 1；浮层打开时 contentRows 已收缩，必须动态取 */
+  const overlayTop = () => contentRowsOf() + 7
+
+  it('AC-25：confirm 浮层出现在预留区（标题/消息/提示三行），y → true 且关闭后布局复原', async () => {
+    ui.enter(overlayHandlers)
+    const p = ui.openInteractionOverlay({ kind: 'confirm', title: '删除这个文件？', message: '不可撤销', defaultYes: false })
+
+    expect(term.row(RESERVED_TOP)).toContain('删除这个文件？')
+    expect(term.row(RESERVED_TOP + 1)).toContain('不可撤销')
+    expect(term.row(RESERVED_TOP + 2)).toContain('y / n')
+    // 浮层画在预留区：内容区（含 banner）不受影响，也没有新增滚动区行
+    expect(term.contains('banner-line-1')).toBe(true)
+    expect(contentRowsOf()).toBe(CONTENT_ROWS) // confirm 高度=预留区默认 3 → 内容区不收缩
+
+    press('y', 'y')
+    await expect(p).resolves.toEqual({ kind: 'confirm', value: true })
+    // 关闭后预留区被清空、输入框仍在原位（不做增量改滚动区）
+    expect(term.row(RESERVED_TOP)).toBe('')
+    expect(term.row(INPUT_TOP)).toContain('+-- input')
+    expect(term.row(INPUT_BOT)).toContain('+---')
+  })
+
+  it('AC-25：Enter → defaultYes；n → false；Esc → 取消（真实形状 meta=true / str=undefined）', async () => {
+    ui.enter(overlayHandlers)
+
+    const pEnter = ui.openInteractionOverlay({ kind: 'confirm', title: '默认否？', defaultYes: false })
+    pressEnter()
+    await expect(pEnter).resolves.toEqual({ kind: 'confirm', value: false })
+
+    const pN = ui.openInteractionOverlay({ kind: 'confirm', title: '拒绝？' })
+    press('n', 'n')
+    await expect(pN).resolves.toEqual({ kind: 'confirm', value: false })
+
+    const pEsc = ui.openInteractionOverlay({ kind: 'confirm', title: '取消？' })
+    pressEsc()
+    await expect(pEsc).resolves.toEqual({ kind: 'cancelled' })
+    expect(term.row(RESERVED_TOP)).toBe('')
+  })
+
+  it('AC-25/AC-26：浮层期间 ↑↓/Tab/可打印字符被独占消费，不进输入缓冲、不提交', async () => {
+    const { submitted, handlers } = collector()
+    ui.enter(handlers)
+    const p = ui.openInteractionOverlay({ kind: 'confirm', title: '继续？' })
+
+    pressUp()
+    pressDown()
+    pressTab()
+    press('x', 'x')
+    pressBare('paste-start', { sequence: '\x1b[200~' })
+    press('a', 'a')
+    pressBare('paste-end', { sequence: '\x1b[201~' })
+
+    expect(submitted).toEqual([]) // 没有提交
+    expect(bufferOf(ui).toText()).toBe('') // 也没污染输入缓冲
+    expect(term.contains('继续？')).toBe(true) // 浮层仍在
+    expect(term.row(INPUT_FIRST)).toContain('| >') // 输入框仍空
+
+    pressEsc()
+    await expect(p).resolves.toEqual({ kind: 'cancelled' })
+    // 关闭后输入恢复可用（↑ 回到历史导航语义，而不是被浮层吃掉）
+    type('hello')
+    expect(term.row(INPUT_FIRST)).toContain('hello')
+  })
+
+  it('AC-26：select 浮层 ↑↓ 移动选中、Enter 提交；开启手动输入后可直接键入自由文本并提交', async () => {
+    ui.enter(overlayHandlers)
+    const p = ui.openInteractionOverlay({
+      kind: 'select',
+      title: '选一个',
+      items: [{ label: 'alpha' }, { label: 'beta' }, { label: 'gamma' }],
+      allowManualInput: true,
+    })
+
+    // 初始选中第 0 项（▶ 标记）；浮层首行是标题，项从 overlayTop()+1 起
+    expect(term.row(overlayTop() + 1)).toContain('▶ alpha')
+    pressDown()
+    expect(term.row(overlayTop() + 1)).not.toContain('▶')
+    expect(term.row(overlayTop() + 2)).toContain('▶ beta')
+
+    // 直接键入自由文本（不写输入缓冲，提示行显示）
+    press('c', 'c')
+    press('x', 'x')
+    expect(term.row(overlayTop() + 4)).toContain('自定义输入：cx')
+    expect(bufferOf(ui).toText()).toBe('')
+
+    pressEnter()
+    await expect(p).resolves.toEqual({ kind: 'select', index: 1, label: 'beta', manual: 'cx' })
+    expect(term.row(RESERVED_TOP)).toBe('')
+  })
+
+  it('AC-26：未开启 allowManualInput 时 Enter 提交选中项（不带 manual）', async () => {
+    ui.enter(overlayHandlers)
+    const p = ui.openInteractionOverlay({ kind: 'select', title: '选一个', items: [{ label: 'one' }, { label: 'two' }] })
+    pressDown()
+    pressEnter()
+    await expect(p).resolves.toEqual({ kind: 'select', index: 1, label: 'two' })
+  })
+
+  it('浮层开关改 contentRows → 走**整区重建**（重发 DECSTBM + 清屏），不是增量改滚动区', async () => {
+    ui.enter(overlayHandlers)
+    const decstbm = () => rawWrites.join('').match(/\x1b\[1;\d+r/g) ?? []
+    const before = decstbm().length
+
+    // select 6 项 → 浮层高度 8 > 预留区 3 → 内容区收缩
+    const p = ui.openInteractionOverlay({
+      kind: 'select',
+      title: '任务列表',
+      items: Array.from({ length: 6 }, (_, i) => ({ label: `task-${i}` })),
+    })
+
+    expect(contentRowsOf()).toBe(24 - 5 - 1 - 8) // = 10
+    const after = decstbm()
+    expect(after.length).toBeGreaterThan(before) // 打开即整区重建
+    expect(after.at(-1)).toBe('\x1b[1;10r') // 新滚动区底部 = 新 contentRows
+    expect(rawWrites.join('')).toContain('\x1b[2J') // 整区重建明确走清屏
+    // 状态栏随重建移动到 contentRows+1；内容区仍在（blocks 是真源，未丢）
+    expect(term.row(contentRowsOf() + 1)).toContain('● Ready')
+    expect(term.row(1)).toContain('banner-line-1')
+    expect(term.row(overlayTop())).toContain('任务列表') // 浮层占据收缩后的预留区
+    expect(term.row(overlayTop() + 6)).toContain('task-5') // 6 项中的最后一项
+
+    pressEsc()
+    await expect(p).resolves.toEqual({ kind: 'cancelled' })
+    expect(contentRowsOf()).toBe(CONTENT_ROWS) // 关闭复原
+    expect(decstbm().at(-1)).toBe(`\x1b[1;${CONTENT_ROWS}r`)
+  })
+
+  it('浮层 + 流式 + resize 三连：无错位、内容不重复、浮层始终可见', async () => {
+    ui.enter(overlayHandlers)
+    ui.addUserMessage('问题')
+    const p = ui.openInteractionOverlay({ kind: 'select', title: '选择方案', items: [{ label: 'A' }, { label: 'B' }] })
+
+    // 流式 token（浮层期间也会走整区重绘路径）
+    for (let i = 0; i < 30; i++) ui.appendToLast(`流式内容第${i}行用于撑开内容区。`)
+    expect(term.contains('选择方案')).toBe(true) // 浮层没有被流式重绘覆盖
+
+    // resize 放大（先扩展模拟屏幕再触发 onResize）
+    Object.defineProperty(process.stdout, 'rows', { value: 30, configurable: true })
+    term.resize(30)
+    ;(ui as any).onResize()
+
+    expect(term.contains('选择方案')).toBe(true)
+    expect(term.contains('banner-line-1')).toBe(true)
+    expect(contentRowsOf()).toBe(30 - 5 - 1 - 4) // select 2 项高度 4 > 预留区 3 → 内容区收缩到 4 行预留
+    // 内容不重复（历史 + 可见里"第0行"至多一次）
+    const all = [...term.historyText(), ...term.visible()]
+    expect(all.filter((l) => l.includes('流式内容第0行')).length).toBeLessThanOrEqual(1)
+
+    pressEsc()
+    await expect(p).resolves.toEqual({ kind: 'cancelled' })
+    expect(term.contains('banner-line-1')).toBe(true)
+  })
+
+  it('浮层期间粘贴整段内容被丢弃：不提交、不进缓冲、不误触浮层', async () => {
+    const { submitted, handlers } = collector()
+    ui.enter(handlers)
+    const p = ui.openInteractionOverlay({ kind: 'confirm', title: '继续？' })
+
+    pasteText('AAA\rBBB\rCCC') // 粘贴里的 \r 若被浮层当 Enter 会误提交
+
+    expect(submitted).toEqual([])
+    expect(bufferOf(ui).toText()).toBe('')
+    expect(term.contains('继续？')).toBe(true)
+    pressEsc()
+    await expect(p).resolves.toEqual({ kind: 'cancelled' })
+  })
+
+  it('同一时刻只允许一个浮层：打开第二个时第一个按取消结算', async () => {
+    ui.enter(overlayHandlers)
+    const first = ui.openInteractionOverlay({ kind: 'confirm', title: '第一个' })
+    const second = ui.openInteractionOverlay({ kind: 'confirm', title: '第二个' })
+
+    await expect(first).resolves.toEqual({ kind: 'cancelled' })
+    expect(term.contains('第二个')).toBe(true)
+    press('y', 'y')
+    await expect(second).resolves.toEqual({ kind: 'confirm', value: true })
+  })
+
+  it('全屏选择器接管期间打开浮层 → 安全失败（cancelled），不叠加模态、不破坏布局', async () => {
+    ui.enter(overlayHandlers)
+    ui.openSelector([{ label: 'model-a' }], { onPick: () => {}, onCancel: () => {}, title: 'Select model' })
+    expect(term.contains('Select model')).toBe(true)
+
+    const p = ui.openInteractionOverlay({ kind: 'confirm', title: '不该出现' })
+    await expect(p).resolves.toEqual({ kind: 'cancelled' })
+    expect(term.contains('不该出现')).toBe(false)
+    expect(term.contains('Select model')).toBe(true) // 选择器画面未被破坏
+    expect(contentRowsOf()).toBe(CONTENT_ROWS)
+  })
+
+  it('退出（exit）会释放挂起的浮层 Promise，不留悬挂 resolver', async () => {
+    ui.enter(overlayHandlers)
+    const p = ui.openInteractionOverlay({ kind: 'input', title: '输入点东西' })
+    ui.exit()
+    await expect(p).resolves.toEqual({ kind: 'cancelled' })
+    expect((ui as any).interactiveOverlay).toBeNull()
+  })
+})
+
+/**
+ * FR-4：斜杠补全菜单（AC-19 / AC-20 / AC-21 / AC-22 + V-5 的固定高度）。
+ *
+ * 渲染位置与内联浮层相同：**预留区**（输入框下边框之下）。菜单高度 = `min(候选总数, 8) + 1`，
+ * 在菜单生命周期内**恒定**（V-5）→ 打字过滤只重绘预留区，整区重建只发生在"出现/消失"各一次。
+ *
+ * ⚠️ 键位事件形状来自**真实 `readline.emitKeypressEvents` 探针**（lesson 007 / D-7；B5 用
+ * 每个按键独立 `PassThrough` 的 node 脚本重跑确认，脚本为临时文件未入库）。本批新增两条最易错：
+ * - **`/` 是可打印符号，真实事件里没有 `name` 字段**（`str='/'`、`name=undefined`）→ 用
+ *   `pressSlash()` 精确派发；把 `/` 当成 `name==='/'` 的按键建模会与生产不一致。
+ * - **Tab = `{str:'\t', name:'tab'}`；Enter(CR) = `{str:'\r', name:'return'}`；
+ *   Esc = `{str:undefined, name:'escape', meta:true}`；↑↓ = `str:undefined`**（见 overlay describe）。
+ * 菜单打开时用户仍在输入查询串，故"整段字符串当单 keypress"同样禁止。
+ */
+describe('TUI 端到端：斜杠补全（FR-4 / AC-19~22 / V-5）', () => {
+  const handlers = { onEnter: () => {}, onExit: () => {}, onInterrupt: () => {} }
+
+  /** 内置命令规格（与 index.ts 的既有 6 命令同形；`run` 用不到，纯数据） */
+  const SPECS: CommandSpec[] = [
+    { name: '/exit', description: '退出（会清屏）', run: () => {} },
+    { name: '/quit', description: '退出（会清屏）', run: () => {} },
+    { name: '/clear', description: '重开会话（清屏）', run: () => {} },
+    { name: '/help', description: '显示帮助', run: () => {} },
+    { name: '/memory', description: '查看记忆索引', run: () => {} },
+    { name: '/model', description: '切换模型与思考等级', run: () => {} },
+  ]
+
+  /** 10 条候选（V-5 用例）：/a1../a3 + /b1../b7 */
+  const TEN: CompletionCandidate[] = [
+    ...['a1', 'a2', 'a3', 'b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7'].map((s) => ({
+      label: `/${s}`,
+      kind: 'other' as const,
+    })),
+  ]
+
+  function registryOf(items: CompletionCandidate[]): CompletionRegistry {
+    const r = new CompletionRegistry()
+    r.register({ id: 'test', list: () => items })
+    return r
+  }
+
+  /** 真实形状的 `/`：可打印符号，事件里没有 name 字段（探针实测） */
+  function pressSlash() {
+    ;(process.stdin as any).emit('keypress', '/', { ctrl: false, shift: false, meta: false, sequence: '/' })
+  }
+  /** 真实形状的字母/数字（name = 该字符） */
+  function typeChars(s: string) {
+    for (const ch of s) press(ch, ch)
+  }
+  const pressTab = () => press('\t', 'tab', { sequence: '\t' })
+  const pressEnter = () => press('\r', 'return', { sequence: '\r' })
+  const pressEsc = () => (process.stdin as any).emit('keypress', undefined, { name: 'escape', meta: true, sequence: '\x1b' })
+  const pressUp = () => (process.stdin as any).emit('keypress', undefined, { name: 'up', sequence: '\x1b[A' })
+  const pressDown = () => (process.stdin as any).emit('keypress', undefined, { name: 'down', sequence: '\x1b[B' })
+
+  const contentRowsOf = () => (ui as any).contentRows as number
+  const reservedRowsOf = () => (ui as any).reservedRows() as number
+  const menuOf = () => (ui as any).completionMenu as { height: number; index: number; filtered: unknown[] } | null
+  /** 预留区首行 = contentRows + 状态栏(1) + 输入框(5) + 1；菜单打开时 contentRows 已收缩，必须动态取 */
+  const reservedTop = () => contentRowsOf() + 7
+  /** 整区重建次数 = 重发 DECSTBM 的次数（onResize 重建循环的唯一可观测副作用） */
+  const rebuilds = () => (rawWrites.join('').match(/\x1b\[1;\d+r/g) ?? []).length
+
+  it('AC-19：输入 `/` 后菜单出现在预留区并列出全部 6 个内置命令，Esc 关闭后布局复原', async () => {
+    ui.enter(handlers)
+    ui.setCompletionRegistry(registryOf(createBuiltinSource(SPECS).list() as CompletionCandidate[]))
+
+    pressSlash()
+    await flush()
+
+    const m = menuOf()
+    expect(m).not.toBeNull()
+    expect(m!.height).toBe(SPECS.length + 1) // 6 项 + 提示行
+    expect(contentRowsOf()).toBe(24 - 5 - 1 - m!.height) // 内容区收缩
+    expect(reservedRowsOf()).toBe(m!.height)
+
+    // 6 个命令全部列出（整屏拼接匹配：菜单行可能被截断，断言不靠单行 contains 之外的手段）
+    const screen = term.dump().join(' ')
+    for (const s of SPECS) expect(screen).toContain(s.name)
+    // 首项默认选中（▶），提示行在末行
+    expect(term.row(reservedTop())).toContain('▶ /exit')
+    expect(term.row(contentRowsOf() + 7 + m!.height - 1)).toContain('Tab 填入')
+
+    pressEsc()
+    expect(menuOf()).toBeNull()
+    expect(contentRowsOf()).toBe(CONTENT_ROWS) // 关闭复原
+    expect(term.row(reservedTop())).toBe('') // 预留区被清空
+  })
+
+  it('AC-20：继续输入字符按前缀/模糊过滤，且选中项重置到第一项', async () => {
+    ui.enter(handlers)
+    ui.setCompletionRegistry(registryOf(createBuiltinSource(SPECS).list() as CompletionCandidate[]))
+    pressSlash()
+    await flush()
+
+    // 先移开选中项（↓ 两次 → 第 2 项）
+    pressDown()
+    pressDown()
+    expect(menuOf()!.index).toBe(2)
+
+    typeChars('he') // 前缀过滤 → 只剩 /help
+    expect(menuOf()!.index).toBe(0) // 选中重置（AC-20）
+    expect(menuOf()!.filtered).toHaveLength(1)
+    expect(term.row(reservedTop())).toContain('▶ /help')
+    // 过滤不改变菜单高度（V-5）→ 预留区行数仍为 6+1
+    expect(menuOf()!.height).toBe(SPECS.length + 1)
+  })
+
+  it('AC-21：↑↓ 移动选中；Tab 只填入不提交；Enter 直接执行选中命令', async () => {
+    const { submitted, handlers: h } = collector()
+    ui.enter(h)
+    ui.setCompletionRegistry(registryOf(createBuiltinSource(SPECS).list() as CompletionCandidate[]))
+    pressSlash()
+    await flush()
+
+    pressDown()
+    expect(term.row(reservedTop() + 1)).toContain('▶ /quit')
+
+    pressTab()
+    expect(submitted).toEqual([]) // Tab 不提交
+    expect(bufferOf(ui).toText()).toBe('/quit') // 只填入
+    expect(menuOf()).toBeNull() // 填入后关闭
+    expect(contentRowsOf()).toBe(CONTENT_ROWS)
+
+    pressEnter() // 此时是普通提交路径
+    expect(submitted).toEqual(['/quit'])
+  })
+
+  it('AC-21：Enter 在菜单打开时直接执行选中项（先填入再走既有提交路径）', async () => {
+    const { submitted, handlers: h } = collector()
+    ui.enter(h)
+    ui.setCompletionRegistry(registryOf(createBuiltinSource(SPECS).list() as CompletionCandidate[]))
+    pressSlash()
+    await flush()
+
+    pressDown()
+    pressEnter()
+    expect(submitted).toEqual(['/quit'])
+    expect(menuOf()).toBeNull()
+    expect(bufferOf(ui).toText()).toBe('') // submit 清空缓冲
+  })
+
+  it('AC-22：Esc 关闭菜单且保留输入；关闭后 ↑↓ 恢复为历史导航（不再被菜单消费）', async () => {
+    const { submitted, handlers: h } = collector()
+    ui.enter(h)
+    ui.setCompletionRegistry(registryOf(createBuiltinSource(SPECS).list() as CompletionCandidate[]))
+
+    // 先攒一条历史
+    typeChars('hello')
+    pressEnter()
+    expect(submitted).toEqual(['hello'])
+
+    pressSlash()
+    await flush()
+    expect(menuOf()).not.toBeNull()
+
+    pressEsc()
+    expect(menuOf()).toBeNull()
+    expect(bufferOf(ui).toText()).toBe('/') // 输入保留（AC-22）
+    expect(contentRowsOf()).toBe(CONTENT_ROWS)
+    expect(term.row(INPUT_FIRST)).toContain('/')
+
+    // 关闭后 ↑ 必须是历史导航（若仍被菜单消费，缓冲区不会是 'hello'）
+    pressUp()
+    expect(bufferOf(ui).toText()).toBe('hello')
+    expect(term.row(INPUT_FIRST)).toContain('hello')
+    expect(menuOf()).toBeNull() // 历史回填不重新打开菜单
+  })
+
+  it('V-5：候选 10 → 3 → 1 → 0 时菜单高度/reservedRows()/contentRows 全程不变，重建次数 = 2', async () => {
+    ui.enter(handlers)
+    ui.setCompletionRegistry(registryOf(TEN))
+
+    const rebuildsBefore = rebuilds()
+    const rowsBefore = contentRowsOf()
+    expect(rowsBefore).toBe(CONTENT_ROWS)
+
+    pressSlash()
+    await flush() // 打开是异步的（collect() 是 Promise）
+    expect(menuOf()!.height).toBe(9) // min(10,8)+1
+    const rows = contentRowsOf()
+    const reserved = reservedRowsOf()
+    expect(rows).toBe(24 - 5 - 1 - 9) // 9
+    expect(reserved).toBe(9)
+    expect(rebuilds() - rebuildsBefore).toBe(1) // 出现：整区重建 1 次
+
+    typeChars('a') // 10 → 3
+    expect(menuOf()!.filtered).toHaveLength(3)
+    expect(menuOf()!.height).toBe(9)
+    expect(contentRowsOf()).toBe(rows)
+    expect(reservedRowsOf()).toBe(reserved)
+
+    typeChars('1') // 3 → 1
+    expect(menuOf()!.filtered).toHaveLength(1)
+    expect(menuOf()!.height).toBe(9)
+    expect(contentRowsOf()).toBe(rows)
+    expect(reservedRowsOf()).toBe(reserved)
+
+    typeChars('z') // 1 → 0：占位行，行数仍不变
+    expect(menuOf()!.filtered).toHaveLength(0)
+    expect(menuOf()!.height).toBe(9)
+    expect(contentRowsOf()).toBe(rows)
+    expect(reservedRowsOf()).toBe(reserved)
+    expect(term.dump().join(' ')).toContain('无匹配命令')
+    // 过滤全程零重建（只有打开那一次）
+    expect(rebuilds() - rebuildsBefore).toBe(1)
+
+    pressEsc() // 消失：整区重建第 2 次
+    expect(menuOf()).toBeNull()
+    expect(rebuilds() - rebuildsBefore).toBe(2)
+    expect(contentRowsOf()).toBe(rowsBefore)
+    expect(term.row(reservedTop())).toBe('')
+  })
+
+  it('菜单打开期间粘贴：整段进输入缓冲参与过滤，不误触发选中项', async () => {
+    const { submitted, handlers: h } = collector()
+    ui.enter(h)
+    ui.setCompletionRegistry(registryOf(createBuiltinSource(SPECS).list() as CompletionCandidate[]))
+    pressSlash()
+    await flush()
+
+    pasteText('he') // 粘贴里的 \r 若被菜单当 Enter 会误执行
+    expect(submitted).toEqual([])
+    expect(bufferOf(ui).toText()).toBe('/he')
+    expect(menuOf()!.filtered).toHaveLength(1)
+    expect(term.row(reservedTop())).toContain('▶ /help')
+  })
+
+  it('菜单打开期间 resize：高度不变、菜单与内容都不丢，关闭后按新行数复原', async () => {
+    ui.enter(handlers)
+    ui.setCompletionRegistry(registryOf(TEN))
+    pressSlash()
+    await flush()
+    expect(menuOf()!.height).toBe(9)
+
+    // 流式/提示等任何触发 renderFixed 的路径都必须保持菜单可见
+    ui.addInfo('菜单期间的提示')
+    expect(term.dump().join(' ')).toContain('菜单期间的提示')
+    expect(menuOf()!.height).toBe(9)
+
+    Object.defineProperty(process.stdout, 'rows', { value: 30, configurable: true })
+    term.resize(30)
+    ;(ui as any).onResize()
+
+    expect(menuOf()!.height).toBe(9) // 高度不随 resize 变（取决于候选总数）
+    expect(contentRowsOf()).toBe(30 - 5 - 1 - 9)
+    expect(term.dump().join(' ')).toContain('/a1')
+    const all = [...term.historyText(), ...term.visible()]
+    expect(all.filter((l) => l.includes('banner-line-1')).length).toBeLessThanOrEqual(1) // 不重复
+
+    pressEsc()
+    expect(contentRowsOf()).toBe(30 - 5 - 1 - 3) // 关闭后回到默认预留区
+  })
+
+  it('未注入候选源（既有裸 TUI）时输入 `/` 不弹菜单（回归：既有用例零影响）', async () => {
+    ui.enter(handlers)
+    pressSlash()
+    await flush()
+    expect(menuOf()).toBeNull()
+    expect(contentRowsOf()).toBe(CONTENT_ROWS)
+    expect(bufferOf(ui).toText()).toBe('/')
+  })
+
+  /**
+   * AC-23（V-6 用户拍板 2026-09-17）：技能发现层已在本任务落地，故本用例**不再是 `it.skip`**。
+   *
+   * 端到端链路 = 真实 `createSkillCompletionSource()`（真读磁盘上的 `SKILL.md`）→ `CompletionRegistry`
+   * → TUI 菜单 → 过滤 → Enter 执行。**隔离**：`beforeEach` 已把 `AGENT_CLI_DIR` 指向临时目录
+   * （`afterEach` 删除），项目级目录显式注入临时目录 —— 不写真实 `~/.agent-cli`、不碰工作树。
+   */
+  it('AC-23：已发现的技能出现在 `/` 候选列表中，且可被选中后执行（V-6）', async () => {
+    // D29 技能文件格式：Markdown + frontmatter（name/description 必填、allowed-tools 可选）
+    const userSkills = join(tmp, 'skills')
+    mkdirSync(join(userSkills, 'demo-skill'), { recursive: true })
+    writeFileSync(
+      join(userSkills, 'demo-skill', 'SKILL.md'),
+      '---\nname: demo-skill\ndescription: 演示技能\nallowed-tools: read, write\n---\n正文\n',
+    )
+    // 坏文件①：缺必填字段 description → 跳过 + 告警（不得抛）
+    mkdirSync(join(userSkills, 'broken-skill'), { recursive: true })
+    writeFileSync(join(userSkills, 'broken-skill', 'SKILL.md'), '---\nname: broken-skill\n---\n正文\n')
+    // 坏文件②：完全没有 frontmatter → 跳过 + 告警
+    mkdirSync(join(userSkills, 'no-frontmatter'), { recursive: true })
+    writeFileSync(join(userSkills, 'no-frontmatter', 'SKILL.md'), '# 只有正文\n')
+    // 项目级技能（第二个扫描根）：证明用户级 + 项目级会合并进同一候选列表
+    const projSkills = join(tmp, 'project-skills')
+    mkdirSync(join(projSkills, 'proj-skill'), { recursive: true })
+    writeFileSync(join(projSkills, 'proj-skill', 'SKILL.md'), '---\nname: proj-skill\ndescription: 项目技能\n---\n')
+
+    const warnings: string[] = []
+    const { submitted, handlers: h } = collector()
+    ui.enter(h)
+    const r = new CompletionRegistry()
+    r.register(createBuiltinSource(SPECS))
+    r.register(createSkillCompletionSource({ projectDir: projSkills, warn: (m) => warnings.push(m) }))
+    ui.setCompletionRegistry(r)
+
+    pressSlash()
+    await flush()
+
+    // 真技能出现在候选（整屏拼接断言，lesson 010）
+    const screen = term.dump().join(' ')
+    expect(screen).toContain('/demo-skill')
+    expect(screen).toContain('/proj-skill')
+    // 坏文件被跳过（不进菜单）+ 告警确实产生
+    expect(screen).not.toContain('/broken-skill')
+    expect(screen).not.toContain('no-frontmatter')
+    expect(warnings.join('\n')).toContain('缺少必填字段 description')
+    expect(warnings.join('\n')).toContain('缺少 frontmatter')
+    // V-5：高度仍只由"打开时的候选总数"决定（6 命令 + 2 技能 + 提示行 = 9）
+    expect(menuOf()!.height).toBe(SPECS.length + 2 + 1)
+
+    // 过滤到技能 → 选中 → Enter 执行（走既有"填入 + 提交"路径）
+    typeChars('demo')
+    await flush()
+    expect(menuOf()!.filtered).toHaveLength(1)
+    expect(term.row(reservedTop())).toContain('▶ /demo-skill')
+    expect(menuOf()!.height).toBe(SPECS.length + 2 + 1) // 过滤不改高度（V-5 未被技能源破坏）
+
+    pressEnter()
+    expect(submitted).toEqual(['/demo-skill'])
+  })
+})
+
